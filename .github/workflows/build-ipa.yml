@@ -1,0 +1,64 @@
+name: Build Jtunes IPA
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-ipa:
+    runs-on: macos-26
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Dependencies & Sync iOS
+        run: |
+          npm install
+          npm run build
+          npx cap sync ios
+
+      - name: Build Unsigned iOS Archive
+        working-directory: ios/App
+        run: |
+          if [ -f "Podfile" ]; then
+            pod install
+            xcodebuild -workspace App.xcworkspace \
+              -scheme App \
+              -configuration Release \
+              -sdk iphoneos \
+              -archivePath $RUNNER_TEMP/App.xcarchive \
+              archive \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGNING_IDENTITY="" \
+              AD_HOC_CODE_SIGNING_ALLOWED=YES
+          else
+            xcodebuild -project App.xcodeproj \
+              -scheme App \
+              -configuration Release \
+              -sdk iphoneos \
+              -archivePath $RUNNER_TEMP/App.xcarchive \
+              archive \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGNING_IDENTITY="" \
+              AD_HOC_CODE_SIGNING_ALLOWED=YES
+          fi
+
+      - name: Package .app into .ipa
+        run: |
+          mkdir -p $RUNNER_TEMP/Payload
+          cp -r $RUNNER_TEMP/App.xcarchive/Products/Applications/App.app $RUNNER_TEMP/Payload/
+          cd $RUNNER_TEMP
+          zip -qry Jtunes.ipa Payload
+
+      - name: Upload Finished IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jtunes-IPA
+          path: ${{ runner.temp }}/Jtunes.ipa
