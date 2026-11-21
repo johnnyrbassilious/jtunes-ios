@@ -59,6 +59,7 @@ export function FullScreenPlayer() {
     audioOnlyMode,
     autoplayRelated,
     isExpanded,
+    isQueueOpen,
     isLyricsViewOpen,
     playerError,
     pipMessage,
@@ -80,12 +81,12 @@ export function FullScreenPlayer() {
     toggleAudioOnlyMode,
     toggleAutoplayRelated,
     setExpanded,
+    setQueueOpen: setIsQueueOpen,
     setLyricsViewOpen,
     clearPlayerError,
     setSleepTimer,
   } = usePlayer();
 
-  const [isQueueOpen, setIsQueueOpen] = useState(false);
   const [showSpeedBar, setShowSpeedBar] = useState(false);
   const [lyrics, setLyrics] = useState<TrackLyricsResult>({
     synced: [],
@@ -122,7 +123,7 @@ export function FullScreenPlayer() {
   const activeLyricRef = useRef<HTMLButtonElement | null>(null);
   const queueScrollContainerRef = useRef<HTMLDivElement | null>(null);
   const nowPlayingSectionRef = useRef<HTMLDivElement | null>(null);
-  const nowPlayingRowElsRef = useRef<Map<number, HTMLLIElement>>(new Map());
+  const nowPlayingRowElsRef = useRef>(new Map());
   const nowPlayingCentersRef = useRef<Array<{ idx: number; centerY: number; height: number }>>([]);
   const queueDragRef = useRef<{
     pointerId: number;
@@ -193,7 +194,7 @@ export function FullScreenPlayer() {
       setQueueEntered(false);
       setTrackMenuTarget(null);
     }
-  }, [isExpanded]);
+  }, [isExpanded, setIsQueueOpen]);
 
   // Smooth bottom-up slide animation for Up Next sheet
   useEffect(() => {
