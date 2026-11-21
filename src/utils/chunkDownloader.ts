@@ -3,7 +3,7 @@ import { DEFAULT_BACKEND_URL, resolveStream } from './api';
 import { normalizeBackendUrl } from './formatters';
 import { extractYouTubeVideoId } from './youtube';
 
-export const CHUNK_SIZE_BYTES = 3 * 1024 * 1024; // 3 MB
+export const CHUNK_SIZE_BYTES = 2.5 * 1024 * 1024; // 2.5 MB (matches Vercel /api/stream)
 
 export interface ChunkDownloadProgress {
   receivedBytes: number;
@@ -401,19 +401,21 @@ function pickInnertubeIosFormat(
     : [];
 
   if (mode === 'audio') {
-    const audioCandidates = [...adaptiveFormats, ...formats]
-      .filter((f) => {
-        const mime = typeof f.mimeType === 'string' ? f.mimeType : '';
-        return typeof f.url === 'string' && f.url.length > 0 && mime.startsWith('audio/');
-      })
-      .sort(
-        (a, b) =>
-          Number(b.bitrate ?? b.averageBitrate ?? 0) -
-          Number(a.bitrate ?? a.averageBitrate ?? 0)
-      );
+    const allAudio = [...adaptiveFormats, ...formats].filter((f) => {
+      const mime = typeof f.mimeType === 'string' ? f.mimeType : '';
+      return typeof f.url === 'string' && f.url.length > 0 && mime.startsWith('audio/');
+    });
+    const mp4Audio = allAudio.filter((f) =>
+      String(f.mimeType ?? '').toLowerCase().includes('audio/mp4')
+    );
+    const pool = (mp4Audio.length > 0 ? mp4Audio : allAudio).sort(
+      (a, b) =>
+        Number(b.bitrate ?? b.averageBitrate ?? 0) -
+        Number(a.bitrate ?? a.averageBitrate ?? 0)
+    );
 
-    if (audioCandidates.length > 0) {
-      const chosen = audioCandidates[0];
+    if (pool.length > 0) {
+      const chosen = pool[0];
       const rawMime = typeof chosen.mimeType === 'string' ? chosen.mimeType : 'audio/mp4';
       const len = Number(chosen.contentLength ?? 0);
       return {
@@ -475,7 +477,7 @@ function pickInnertubeIosFormat(
 }
 
 interface InnertubeClientProfile {
-  name: 'ANDROID_VR' | 'IOS';
+  name: 'VISIONOS' | 'ANDROID_VR' | 'IOS';
   userAgent: string;
   clientNameHeader: string;
   clientVersion: string;
@@ -484,14 +486,31 @@ interface InnertubeClientProfile {
 
 const NATIVE_INNERTUBE_CLIENTS: readonly InnertubeClientProfile[] = [
   {
+    name: 'VISIONOS',
+    userAgent:
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15',
+    clientNameHeader: '101',
+    clientVersion: '1.02',
+    clientPayload: {
+      clientName: 'VISIONOS',
+      clientVersion: '1.02',
+      deviceMake: 'Apple',
+      deviceModel: 'RealityDevice17,1',
+      osName: 'visionOS',
+      osVersion: '26.5.23O471',
+      hl: 'en',
+      gl: 'US',
+    },
+  },
+  {
     name: 'ANDROID_VR',
     userAgent:
-      'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+      'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
     clientNameHeader: '28',
-    clientVersion: '1.60.19',
+    clientVersion: '1.65.10',
     clientPayload: {
       clientName: 'ANDROID_VR',
-      clientVersion: '1.60.19',
+      clientVersion: '1.65.10',
       deviceMake: 'Oculus',
       deviceModel: 'Quest 3',
       androidSdkVersion: 32,
@@ -504,16 +523,16 @@ const NATIVE_INNERTUBE_CLIENTS: readonly InnertubeClientProfile[] = [
   {
     name: 'IOS',
     userAgent:
-      'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)',
+      'com.google.ios.youtube/20.11.6 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
     clientNameHeader: '5',
-    clientVersion: '19.45.4',
+    clientVersion: '20.11.6',
     clientPayload: {
       clientName: 'IOS',
-      clientVersion: '19.45.4',
+      clientVersion: '20.11.6',
       deviceMake: 'Apple',
       deviceModel: 'iPhone16,2',
       osName: 'iPhone',
-      osVersion: '18.1.0.22B83',
+      osVersion: '18.3.2.22D82',
       hl: 'en',
       gl: 'US',
     },
@@ -592,7 +611,6 @@ async function downloadBinaryWithCapacitorHttp(
       });
       chunkIdx += 1;
       if (bytes.byteLength > CHUNK_SIZE_BYTES) {
-        // Server ignored Range and returned full payload
         break;
       }
     }
@@ -670,6 +688,7 @@ async function downloadViaNativeCapacitorIos(
           'User-Agent': profile.userAgent,
           'X-YouTube-Client-Name': profile.clientNameHeader,
           'X-YouTube-Client-Version': profile.clientVersion,
+          Origin: 'https://www.youtube.com',
         },
         data: {
           videoId,
@@ -693,6 +712,11 @@ async function downloadViaNativeCapacitorIos(
         typeof response.data === 'string'
           ? (JSON.parse(response.data) as Record<string, unknown>)
           : (response.data as Record<string, unknown>);
+
+      const playability = payload?.playabilityStatus as Record<string, unknown> | undefined;
+      if (playability?.status && playability.status !== 'OK') {
+        continue;
+      }
 
       const streamingData = payload?.streamingData as Record<string, unknown> | undefined;
       if (!streamingData) {
@@ -757,10 +781,9 @@ async function downloadViaNativeCapacitorIos(
       if (signal.aborted || (err instanceof Error && err.name === 'AbortError')) {
         throw err;
       }
-      // Try next InnerTube client profile automatically (ANDROID_VR -> IOS)
+      // Try next InnerTube client profile automatically (VISIONOS -> ANDROID_VR -> IOS)
     }
 
-    // Reset progress cleanly before trying the next client profile
     onProgress({
       receivedBytes: 0,
       totalBytes: null,
@@ -772,18 +795,6 @@ async function downloadViaNativeCapacitorIos(
   return null;
 }
 
-/**
- * Multi-fallback hybrid downloader:
- * 0a. Direct non-YouTube URLs (live radio, direct MP3/MP4 links): bypass YouTube resolution
- *     and download directly via fetch (or CapacitorHttp on native iOS).
- * 0b. On native Capacitor iOS for YouTube URLs: call YouTube InnerTube player API sequentially
- *     with ANDROID_VR (1.60.19) and IOS (19.45.4) via CapacitorHttp from the device IP.
- * 1. Try `${backendUrl}/api/resolve-stream` (up to 4s) and direct fetch.
- * 2. Fall back to sequential 3 MB chunked proxy `${backendUrl}/api/stream?...&chunked=1&start=${offset}`.
- * 3. If backend returns HTTP 500 or fails, fall back on the client to public Piped / Invidious
- *    CORS endpoints (`pipedapi.kavin.rocks`, `api.piped.private.coffee`, `inv.nadeko.net`),
- *    and finally direct browser extraction via Loader.to / Oceansaver CORS API (`ab.cococococ.com` + `p.oceansaver.in`).
- */
 export async function downloadMediaInChunks(params: {
   backendUrl: string;
   targetUrl: string;
@@ -812,7 +823,6 @@ export async function downloadMediaInChunks(params: {
     throw new DOMException('Download aborted', 'AbortError');
   }
 
-  // Always start (or retry) with a clean zeroed progress baseline
   onProgress({
     receivedBytes: 0,
     totalBytes: null,
@@ -830,8 +840,7 @@ export async function downloadMediaInChunks(params: {
   const isNativeIos = Boolean(capacitor?.isNativePlatform?.());
   const capacitorHttp = capacitor?.Plugins?.CapacitorHttp;
 
-  // Step 0a: Direct non-YouTube URLs (e.g., live radio streams, direct MP3/MP4 files)
-  // Always bypass YouTube resolution and attempt direct binary download first.
+  // Step 0a: Direct non-YouTube URLs (live radio, direct MP3/MP4 files)
   if (!targetIsYouTube && /^https?:\/\//i.test(targetUrl)) {
     const directRes = await downloadFromDirectCandidate(
       targetUrl,
@@ -860,7 +869,7 @@ export async function downloadMediaInChunks(params: {
     }
   }
 
-  // Step 0b: Native Capacitor iOS direct YouTube downloader (ANDROID_VR -> IOS)
+  // Step 0b: Native Capacitor iOS direct YouTube downloader (VISIONOS -> ANDROID_VR -> IOS)
   if (isNativeIos && capacitorHttp && videoId) {
     const nativeRes = await downloadViaNativeCapacitorIos(
       videoId,
@@ -876,13 +885,13 @@ export async function downloadMediaInChunks(params: {
     }
   }
 
-  // Step 1: Resolve directUrl via backend and attempt direct fetch
+  // Step 1: Resolve directUrl via Vercel backend and download directly
   const { directUrl, fallbackUrl, resolved } = await resolveStream(
     backendUrl,
     targetUrl,
     mode,
     quality,
-    { timeoutMs: 4000, fetchImpl, signal }
+    { timeoutMs: 5500, fetchImpl, signal }
   );
 
   if (signal.aborted) {
@@ -900,9 +909,24 @@ export async function downloadMediaInChunks(params: {
     if (directRes) {
       return directRes;
     }
+
+    if (isNativeIos && capacitorHttp) {
+      const nativeBackendDirectRes = await downloadBinaryWithCapacitorHttp(
+        directUrl,
+        fallbackMime,
+        null,
+        NATIVE_INNERTUBE_CLIENTS[0].userAgent,
+        signal,
+        onProgress,
+        capacitorHttp
+      );
+      if (nativeBackendDirectRes) {
+        return nativeBackendDirectRes;
+      }
+    }
   }
 
-  // Step 2: Sequential 3 MB chunked proxy requests on backend
+  // Step 2: Sequential 2.5 MB chunked proxy requests on Vercel backend
   const collectedChunks: Uint8Array[] = [];
   let offset = 0;
   let chunkIndex = 1;
@@ -954,9 +978,9 @@ export async function downloadMediaInChunks(params: {
     }
 
     if (
-      bytes.byteLength < CHUNK_SIZE_BYTES ||
-      bytes.byteLength > CHUNK_SIZE_BYTES ||
-      (knownTotalBytes !== null && offset >= knownTotalBytes)
+      bytes.byteLength === 0 ||
+      (knownTotalBytes !== null && offset >= knownTotalBytes) ||
+      (knownTotalBytes === null && bytes.byteLength < CHUNK_SIZE_BYTES)
     ) {
       break;
     }
@@ -973,7 +997,6 @@ export async function downloadMediaInChunks(params: {
     };
   }
 
-  // Try unchunked backend /api/stream if not an explicit 5xx error
   if (backendFailedStatus !== null && backendFailedStatus < 500) {
     const unchunkedRes = await downloadFromDirectCandidate(
       fallbackUrl,
@@ -987,7 +1010,7 @@ export async function downloadMediaInChunks(params: {
     }
   }
 
-  // Step 3: Client-side public Piped / Invidious CORS fallback on HTTP 500 or backend failure
+  // Step 3: Client-side public Piped / Invidious CORS fallback
   if (videoId) {
     const publicUrls = await resolvePublicFallbackUrls(
       videoId,
@@ -1013,7 +1036,7 @@ export async function downloadMediaInChunks(params: {
     }
   }
 
-  // Step 4: Direct browser extraction fallback via Loader.to / Oceansaver CORS API (YouTube only)
+  // Step 4: Loader.to / Oceansaver fallback
   if (targetIsYouTube || videoId) {
     const loaderRes = await downloadViaLoaderFallback(
       targetUrl,
