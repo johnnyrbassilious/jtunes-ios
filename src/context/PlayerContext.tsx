@@ -7,6 +7,7 @@ import React, {
   useRef,
   useState,
 } from 'react';
+import { Capacitor, CapacitorHttp } from '@capacitor/core';
 import { Maximize2, Minimize2, PictureInPicture2 } from 'lucide-react';
 import {
   YouTubePlayerBridge,
@@ -58,23 +59,6 @@ interface ResolvedStreamCacheEntry {
   url: string;
   mime: string;
   expiresAt: number;
-}
-
-interface CapacitorHttpLike {
-  post: (options: {
-    url: string;
-    headers?: Record<string, string>;
-    data?: unknown;
-  }) => Promise<{ status: number; data: unknown }>;
-}
-
-interface CapacitorWindow {
-  Capacitor?: {
-    isNativePlatform?: () => boolean;
-    Plugins?: {
-      CapacitorHttp?: CapacitorHttpLike;
-    };
-  };
 }
 
 interface NetworkInformationLike {
@@ -149,10 +133,9 @@ const DEFAULT_STREAM_CACHE_TTL_MS = 15 * 60 * 1000;
 const STALL_RECOVERY_DELAY_MS = 5000;
 const ROLLING_AUTOPLAY_MIN_UPCOMING = 4;
 
-// Compact valid 250ms silent 8kHz mono 8-bit PCM WAV data URI to keep iOS WKWebView audio session alive during async transitions
 function buildSilentKeepAliveWavDataUri(): string {
   const sampleRate = 8000;
-  const numSamples = 2000; // 250ms
+  const numSamples = 2000;
   const totalSize = 44 + numSamples;
   const bytes = new Uint8Array(totalSize);
   const view = new DataView(bytes.buffer);
@@ -191,7 +174,6 @@ function isAutoplayTrack(track: PlayableTrack): boolean {
   return track.queueOrigin === 'auto';
 }
 
-// Strict queue invariant: ALL non-autoplay tracks strictly precede ALL autoplay tracks
 function enforceQueueOrderInvariant(
   items: readonly PlayableTrack[],
   activeIndex: number
@@ -219,7 +201,6 @@ function enforceQueueOrderInvariant(
   };
 }
 
-// Promote an autoplay track into the end of the Now Playing segment right before remaining autoplay items
 function promoteAutoplayTrackAtIndex(
   items: readonly PlayableTrack[],
   targetIndex: number
@@ -306,21 +287,6 @@ function getEffectiveRequestMode(
   return isAudioOnly || slowNetwork || track.mode === 'audio' ? 'audio' : 'video';
 }
 
-function getNativeCapacitorHttp(): CapacitorHttpLike | null {
-  if (typeof window === 'undefined') {
-    return null;
-  }
-  const cap = (window as unknown as CapacitorWindow).Capacitor;
-  if (!cap?.isNativePlatform?.()) {
-    return null;
-  }
-  const http = cap.Plugins?.CapacitorHttp;
-  if (!http || typeof http.post !== 'function') {
-    return null;
-  }
-  return http;
-}
-
 function pickNativeIosStreamingFormat(
   streamingData: Record<string, unknown>,
   mode: MediaFormatMode,
@@ -343,7 +309,6 @@ function pickNativeIosStreamingFormat(
       const mime = typeof f.mimeType === 'string' ? f.mimeType : '';
       return typeof f.url === 'string' && f.url.length > 0 && mime.startsWith('audio/');
     });
-    // Prefer audio/mp4 (AAC/M4A) for native iOS AVPlayer / <video> compatibility
     const mp4Audio = allAudio.filter((f) =>
       String(f.mimeType ?? '').toLowerCase().includes('audio/mp4')
     );
@@ -394,7 +359,6 @@ function pickNativeIosStreamingFormat(
     };
   }
 
-  // Native iOS AVPlayer / WKWebView plays HLS manifests directly with full HD video + audio + PiP + background audio
   if (hlsManifestUrl) {
     return { url: hlsManifestUrl, mime: 'application/x-mpegURL' };
   }
@@ -409,8 +373,7 @@ async function resolveNativeIosInnertubeStream(
   preferLowestOverhead: boolean,
   signal?: AbortSignal
 ): Promise<ResolvedStreamCacheEntry | null> {
-  const capacitorHttp = getNativeCapacitorHttp();
-  if (!capacitorHttp) {
+  if (!Capacitor.isNativePlatform()) {
     return null;
   }
 
@@ -419,7 +382,7 @@ async function resolveNativeIosInnertubeStream(
       return null;
     }
     try {
-      const resp = await capacitorHttp.post({
+      const resp = await CapacitorHttp.post({
         url: 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
         headers: {
           'Content-Type': 'application/json',
@@ -552,28 +515,31 @@ export function PlayerProvider({
   onListenHistoryUpdated,
 }: PlayerProviderProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const keepAliveAudioRef = useRef<HTMLAudioElement | null>(null);
   const youtubeBridgeRef = useRef<YouTubePlayerBridgeHandle | null>(null);
-  const triedFallbackStageRef = useRef<number>(0); // 0=direct, 1=proxy stream, 2=youtube iframe
+  const triedFallbackStageRef = useRef(0);
   const activeObjectUrlRef = useRef<string | null>(null);
   const synchronousPreloadedRef = useRef<{ trackId: string; src: string } | null>(null);
-  const playedTrackIdsRef = useRef<Set<string>>(new Set());
-  const fetchingRelatedRef = useRef<boolean>(false);
-  const rollingAutoplayInFlightRef = useRef<boolean>(false);
+  const playedTrackIdsRef = useRef(new Set() as any);
+  const fetchingRelatedRef = useRef(false);
+  const rollingAutoplayInFlightRef = useRef(false);
   const lastRollingSeedIdRef = useRef<string | null>(null);
-  const rollingEpochRef = useRef<number>(0);
+  const rollingEpochRef = useRef(0);
   const lastRecordedTrackIdRef = useRef<string | null>(null);
-  const loadNonceRef = useRef<number>(0);
+  const loadNonceRef = useRef(0);
   const resolvedStreamCacheRef = useRef(new Map() as any);
   const activeStreamCacheKeyRef = useRef<string | null>(null);
   const blockedYoutubeIdsRef = useRef(new Map() as any);
-  const embedRecoveryInFlightRef = useRef<boolean>(false);
+  const embedRecoveryInFlightRef = useRef(false);
   const stallRecoveryTimerRef = useRef<number | null>(null);
-  const lastStallTimeRef = useRef<number>(0);
+  const lastStallTimeRef = useRef(0);
+  const backgroundHiddenAtRef = useRef(0);
+  const shouldKeepPlayingInBackgroundRef = useRef(false);
 
   const [queue, setQueue] = useState<PlayableTrack[]>([]);
-  const [currentIndex, setCurrentIndex] = useState<number>(-1);
-  const [playNonce, setPlayNonce] = useState<number>(0);
+  const [currentIndex, setCurrentIndex] = useState(-1);
+  const [playNonce, setPlayNonce] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -605,6 +571,40 @@ export function PlayerProvider({
     }
     return queue[currentIndex];
   }, [queue, currentIndex]);
+
+  // Use native <audio> for Audio Mode & Live Radio (iOS keeps <audio> playing in background!), <video> for Video Mode
+  const useAudioElementForTrack = useCallback((track: PlayableTrack | null): boolean => {
+    if (!track) {
+      return audioOnlyModeRef.current;
+    }
+    return audioOnlyModeRef.current || Boolean(track.isLiveRadio) || track.mode === 'audio';
+  }, []);
+
+  const getActiveMediaEl = useCallback(
+    (trackOverride?: PlayableTrack | null): HTMLMediaElement | null => {
+      const t = trackOverride !== undefined ? trackOverride : currentTrack;
+      return useAudioElementForTrack(t) ? audioRef.current : videoRef.current;
+    },
+    [currentTrack, useAudioElementForTrack]
+  );
+
+  const stopInactiveMediaEl = useCallback((activeEl: HTMLMediaElement | null) => {
+    const otherEl = activeEl === audioRef.current ? videoRef.current : audioRef.current;
+    if (!otherEl) {
+      return;
+    }
+    try {
+      if (!otherEl.paused) {
+        otherEl.pause();
+      }
+      if (otherEl.hasAttribute('src')) {
+        otherEl.removeAttribute('src');
+        otherEl.load();
+      }
+    } catch {
+      // Ignore cleanup errors
+    }
+  }, []);
 
   const activeEqPreset = useMemo(() => detectActiveEqPreset(eqGains), [eqGains]);
 
@@ -743,7 +743,6 @@ export function PlayerProvider({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [isVideoFullscreen]);
 
-  // Sync audioOnlyMode when defaultPlayMode preference changes if nothing is actively playing
   useEffect(() => {
     if (!currentTrack) {
       const nextAudio = defaultPlayMode === 'audio';
@@ -769,18 +768,19 @@ export function PlayerProvider({
       const trackKey = ytId || targetUrl;
       const cacheKey = buildStreamCacheKey(trackKey, requestMode, quality);
 
-      const cached = (resolvedStreamCacheRef.current ??= new Map()).get(cacheKey);
+      const cacheMap = resolvedStreamCacheRef.current;
+      const cached = cacheMap.get(cacheKey);
       if (cached && cached.expiresAt > Date.now()) {
         return { entry: cached, cacheKey };
       }
       if (cached) {
-        (resolvedStreamCacheRef.current ??= new Map()).delete(cacheKey);
+        cacheMap.delete(cacheKey);
       }
 
       const slowNetwork = isSlowNetworkConnection();
 
-      // 1. Native iOS CapacitorHttp direct VISIONOS InnerTube resolution (zero iframe blocks + full background audio)
-      if (ytId && getNativeCapacitorHttp()) {
+      // 1. Native iOS CapacitorHttp direct VISIONOS InnerTube resolution
+      if (ytId && Capacitor.isNativePlatform()) {
         const nativeEntry = await resolveNativeIosInnertubeStream(
           ytId,
           requestMode,
@@ -789,7 +789,7 @@ export function PlayerProvider({
           signal
         );
         if (nativeEntry && !signal?.aborted) {
-          (resolvedStreamCacheRef.current ??= new Map()).set(cacheKey, nativeEntry);
+          cacheMap.set(cacheKey, nativeEntry);
           return { entry: nativeEntry, cacheKey };
         }
       }
@@ -810,7 +810,7 @@ export function PlayerProvider({
           mime: requestMode === 'audio' ? 'audio/mp4' : 'video/mp4',
           expiresAt: computeStreamExpiry(result.directUrl),
         };
-        (resolvedStreamCacheRef.current ??= new Map()).set(cacheKey, entry);
+        cacheMap.set(cacheKey, entry);
         return { entry, cacheKey };
       }
 
@@ -840,14 +840,15 @@ export function PlayerProvider({
           : []),
       ];
 
+      const cacheMap = resolvedStreamCacheRef.current;
       const now = Date.now();
       for (const key of candidateKeys) {
-        const cached = (resolvedStreamCacheRef.current ??= new Map()).get(key);
+        const cached = cacheMap.get(key);
         if (cached && cached.expiresAt > now) {
           return { entry: cached, cacheKey: key };
         }
         if (cached) {
-          (resolvedStreamCacheRef.current ??= new Map()).delete(key);
+          cacheMap.delete(key);
         }
       }
       return null;
@@ -855,16 +856,18 @@ export function PlayerProvider({
     [defaultQuality]
   );
 
-  const startNativeVideoPlayback = useCallback(
-    (video: HTMLVideoElement, src: string, rate: number) => {
+  const startNativeMediaPlayback = useCallback(
+    (mediaEl: HTMLMediaElement, src: string, rate: number) => {
+      stopInactiveMediaEl(mediaEl);
       stopBackgroundKeepAlive();
-      if (video.src !== src) {
-        video.src = src;
+      if (mediaEl.src !== src) {
+        mediaEl.src = src;
       }
-      video.playbackRate = rate;
-      video.loop = false;
+      mediaEl.playbackRate = rate;
+      mediaEl.loop = false;
+      shouldKeepPlayingInBackgroundRef.current = true;
 
-      const playPromise = video.play();
+      const playPromise = mediaEl.play();
       if (playPromise && typeof playPromise.catch === 'function') {
         playPromise.catch((err: unknown) => {
           if (err instanceof Error && err.name === 'AbortError') {
@@ -874,13 +877,13 @@ export function PlayerProvider({
         });
       }
     },
-    [stopBackgroundKeepAlive]
+    [stopBackgroundKeepAlive, stopInactiveMediaEl]
   );
 
-  // Instant playback loader + true data-saving Audio Mode vs Video Mode resolution
+  // Instant playback loader + Audio (<audio>) vs Video (<video>) routing
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) {
+    const mediaEl = getActiveMediaEl(currentTrack);
+    if (!mediaEl) {
       return;
     }
 
@@ -889,10 +892,14 @@ export function PlayerProvider({
 
     if (!currentTrack) {
       synchronousPreloadedRef.current = null;
+      shouldKeepPlayingInBackgroundRef.current = false;
       stopBackgroundKeepAlive();
-      video.pause();
-      video.removeAttribute('src');
-      video.load();
+      [audioRef.current, videoRef.current].forEach((el) => {
+        if (!el) return;
+        el.pause();
+        el.removeAttribute('src');
+        el.load();
+      });
       revokeActiveObjectUrl();
       setYoutubeFallbackId(null);
       setIsPlaying(false);
@@ -915,17 +922,18 @@ export function PlayerProvider({
       onListenHistoryUpdated?.(updatedHistory.length);
     }
 
-    // If YouTube IFrame fallback was activated for this track, keep native <video> stopped
     if (youtubeFallbackId) {
       synchronousPreloadedRef.current = null;
       stopBackgroundKeepAlive();
-      video.pause();
-      video.removeAttribute('src');
-      video.load();
+      [audioRef.current, videoRef.current].forEach((el) => {
+        if (!el) return;
+        el.pause();
+        el.removeAttribute('src');
+        el.load();
+      });
       return;
     }
 
-    // If handleEnded already started this exact track synchronously on <video> for seamless iOS background audio, keep it playing uninterrupted
     const preloaded = synchronousPreloadedRef.current;
     if (preloaded && preloaded.trackId === currentTrack.id && !overrideStreamUrl) {
       synchronousPreloadedRef.current = null;
@@ -934,8 +942,8 @@ export function PlayerProvider({
       setCurrentTime(0);
       setDuration(currentTrack.duration > 0 ? currentTrack.duration : 0);
       syncMediaSessionMetadataNow(currentTrack, true, 0, currentTrack.duration, playbackRate);
-      if (video.paused) {
-        startNativeVideoPlayback(video, preloaded.src, playbackRate);
+      if (mediaEl.paused) {
+        startNativeMediaPlayback(mediaEl, preloaded.src, playbackRate);
       }
       return;
     }
@@ -953,7 +961,7 @@ export function PlayerProvider({
       revokeActiveObjectUrl();
       const freshUrl = URL.createObjectURL(offlineBlob);
       activeObjectUrlRef.current = freshUrl;
-      startNativeVideoPlayback(video, freshUrl, playbackRate);
+      startNativeMediaPlayback(mediaEl, freshUrl, playbackRate);
       return;
     }
 
@@ -966,7 +974,7 @@ export function PlayerProvider({
       const radioUrl =
         currentTrack.directStreamUrl || currentTrack.streamUrl || currentTrack.sourceUrl || currentTrack.url || '';
       if (radioUrl) {
-        startNativeVideoPlayback(video, radioUrl, playbackRate);
+        startNativeMediaPlayback(mediaEl, radioUrl, playbackRate);
         return;
       }
     }
@@ -974,11 +982,11 @@ export function PlayerProvider({
     // 3. Explicit override or already-resolved stream URL
     const preResolvedSrc = overrideStreamUrl || currentTrack.streamUrl;
     if (preResolvedSrc) {
-      startNativeVideoPlayback(video, preResolvedSrc, playbackRate);
+      startNativeMediaPlayback(mediaEl, preResolvedSrc, playbackRate);
       return;
     }
 
-    // 4. Unresolved stream URL: check in-memory cache first, then native iOS CapacitorHttp / /api/resolve-stream
+    // 4. Unresolved stream URL: check cache first, then native iOS VISIONOS / backend
     const targetUrl = currentTrack.sourceUrl || currentTrack.url || '';
     const ytId = extractYouTubeVideoId(targetUrl, currentTrack.id);
     if (!targetUrl && !ytId) {
@@ -998,7 +1006,7 @@ export function PlayerProvider({
     if (cachedHit) {
       activeStreamCacheKeyRef.current = cachedHit.cacheKey;
       setYoutubeFallbackId(null);
-      startNativeVideoPlayback(video, cachedHit.entry.url, playbackRate);
+      startNativeMediaPlayback(mediaEl, cachedHit.entry.url, playbackRate);
       return;
     }
 
@@ -1019,7 +1027,6 @@ export function PlayerProvider({
       }
       if (resolved.entry) {
         activeStreamCacheKeyRef.current = resolved.cacheKey;
-        // Native audio/video stream succeeded: keep YouTubePlayerBridge unmounted for background audio & data savings
         setYoutubeFallbackId(null);
         setOverrideStreamUrl(resolved.entry.url);
         return;
@@ -1049,8 +1056,9 @@ export function PlayerProvider({
     youtubeFallbackId,
     backendUrl,
     defaultQuality,
+    getActiveMediaEl,
     revokeActiveObjectUrl,
-    startNativeVideoPlayback,
+    startNativeMediaPlayback,
     stopBackgroundKeepAlive,
     getCachedStreamForTrack,
     syncMediaSessionMetadataNow,
@@ -1058,7 +1066,7 @@ export function PlayerProvider({
     onListenHistoryUpdated,
   ]);
 
-  // Silent background pre-resolution for the NEXT track for zero-gap iOS transitions
+  // Silent background pre-resolution for the NEXT track
   useEffect(() => {
     if (currentIndex < 0 || queue.length === 0) {
       return;
@@ -1100,7 +1108,7 @@ export function PlayerProvider({
     const nextMode = getEffectiveRequestMode(nextTrack, audioOnlyMode, slowNetwork);
     const trackKey = ytId || targetUrl;
     const cacheKey = buildStreamCacheKey(trackKey, nextMode, defaultQuality);
-    const existing = (resolvedStreamCacheRef.current ??= new Map()).get(cacheKey);
+    const existing = resolvedStreamCacheRef.current.get(cacheKey);
     if (existing && existing.expiresAt > Date.now()) {
       return;
     }
@@ -1113,9 +1121,7 @@ export function PlayerProvider({
       defaultQuality,
       controller.signal,
       4500
-    ).catch(() => {
-      // Background pre-buffer failure is non-fatal
-    });
+    ).catch(() => {});
 
     return () => {
       controller.abort();
@@ -1139,7 +1145,6 @@ export function PlayerProvider({
   const queueRef = useRef(queue);
   queueRef.current = queue;
 
-  // Immediately purge all autoplay tracks when Autoplay is turned OFF; reset seed to fetch immediately when turned ON
   useEffect(() => {
     if (!autoplayRelated) {
       rollingEpochRef.current += 1;
@@ -1179,7 +1184,6 @@ export function PlayerProvider({
     lastRollingSeedIdRef.current = null;
   }, [autoplayRelated]);
 
-  // Proactive Rolling Autoplay
   useEffect(() => {
     if (
       !autoplayRelated ||
@@ -1273,9 +1277,11 @@ export function PlayerProvider({
   ]);
 
   useEffect(() => {
-    const video = videoRef.current;
-    if (video) {
-      video.playbackRate = playbackRate;
+    if (videoRef.current) {
+      videoRef.current.playbackRate = playbackRate;
+    }
+    if (audioRef.current) {
+      audioRef.current.playbackRate = playbackRate;
     }
     youtubeBridgeRef.current?.setPlaybackRate(playbackRate);
   }, [playbackRate]);
@@ -1296,15 +1302,15 @@ export function PlayerProvider({
     };
   }, []);
 
-  // Sleep Timer countdown effect
   const pauseActivePlayback = useCallback(() => {
+    shouldKeepPlayingInBackgroundRef.current = false;
     if (youtubeFallbackId) {
       youtubeBridgeRef.current?.pause();
     } else {
-      videoRef.current?.pause();
+      getActiveMediaEl()?.pause();
     }
     setIsPlaying(false);
-  }, [youtubeFallbackId]);
+  }, [getActiveMediaEl, youtubeFallbackId]);
 
   useEffect(() => {
     if (sleepTimerRemainingSec === null) {
@@ -1562,6 +1568,7 @@ export function PlayerProvider({
       }
       const next = prev.filter((_, idx) => idx !== indexToRemove);
       if (next.length === 0) {
+        shouldKeepPlayingInBackgroundRef.current = false;
         stopBackgroundKeepAlive();
         setQueue([]);
         setCurrentIndex(-1);
@@ -1597,6 +1604,7 @@ export function PlayerProvider({
     rollingEpochRef.current += 1;
     rollingAutoplayInFlightRef.current = false;
     lastRollingSeedIdRef.current = null;
+    shouldKeepPlayingInBackgroundRef.current = false;
     stopBackgroundKeepAlive();
     setQueue([]);
     setCurrentIndex(-1);
@@ -1608,10 +1616,9 @@ export function PlayerProvider({
   }, [resetTrackLoadState, stopBackgroundKeepAlive, syncMediaSessionMetadataNow]);
 
   const stopAndClearCurrent = useCallback(() => {
-    const video = videoRef.current;
-    if (video) {
-      video.pause();
-    }
+    shouldKeepPlayingInBackgroundRef.current = false;
+    audioRef.current?.pause();
+    videoRef.current?.pause();
     stopBackgroundKeepAlive();
     youtubeBridgeRef.current?.pause();
     setCurrentIndex(-1);
@@ -1628,34 +1635,38 @@ export function PlayerProvider({
     }
     if (youtubeFallbackId) {
       if (isPlaying) {
+        shouldKeepPlayingInBackgroundRef.current = false;
         youtubeBridgeRef.current?.pause();
         setIsPlaying(false);
       } else {
+        shouldKeepPlayingInBackgroundRef.current = true;
         youtubeBridgeRef.current?.play();
         setIsPlaying(true);
       }
       return;
     }
 
-    const video = videoRef.current;
-    if (!video) {
+    const mediaEl = getActiveMediaEl();
+    if (!mediaEl) {
       return;
     }
     if (eqEnabled) {
-      resumeEqualizerContext(video, eqGains);
+      resumeEqualizerContext(mediaEl as HTMLVideoElement, eqGains);
     }
-    if (video.paused || video.ended) {
+    if (mediaEl.paused || mediaEl.ended) {
+      shouldKeepPlayingInBackgroundRef.current = true;
       try {
-        await video.play();
+        await mediaEl.play();
       } catch (err) {
         setPlayerError(
           err instanceof Error ? err.message : 'Unable to start playback.'
         );
       }
     } else {
-      video.pause();
+      shouldKeepPlayingInBackgroundRef.current = false;
+      mediaEl.pause();
     }
-  }, [currentTrack, eqEnabled, eqGains, isPlaying, youtubeFallbackId]);
+  }, [currentTrack, eqEnabled, eqGains, getActiveMediaEl, isPlaying, youtubeFallbackId]);
 
   const seekTo = useCallback(
     (seconds: number) => {
@@ -1665,17 +1676,17 @@ export function PlayerProvider({
         setCurrentTime(clamped);
         return;
       }
-      const video = videoRef.current;
-      if (!video) {
+      const mediaEl = getActiveMediaEl();
+      if (!mediaEl) {
         return;
       }
       const effectiveDuration =
-        Number.isFinite(video.duration) && video.duration > 0 ? video.duration : duration;
+        Number.isFinite(mediaEl.duration) && mediaEl.duration > 0 ? mediaEl.duration : duration;
       const clamped = clampSeekTime(seconds, effectiveDuration);
-      video.currentTime = clamped;
+      mediaEl.currentTime = clamped;
       setCurrentTime(clamped);
     },
-    [duration, youtubeFallbackId]
+    [duration, getActiveMediaEl, youtubeFallbackId]
   );
 
   const skipBy = useCallback(
@@ -1684,14 +1695,14 @@ export function PlayerProvider({
         seekTo(currentTime + deltaSeconds);
         return;
       }
-      const video = videoRef.current;
-      if (!video) {
+      const mediaEl = getActiveMediaEl();
+      if (!mediaEl) {
         return;
       }
-      const baseTime = Number.isFinite(video.currentTime) ? video.currentTime : currentTime;
+      const baseTime = Number.isFinite(mediaEl.currentTime) ? mediaEl.currentTime : currentTime;
       seekTo(baseTime + deltaSeconds);
     },
-    [currentTime, seekTo, youtubeFallbackId]
+    [currentTime, getActiveMediaEl, seekTo, youtubeFallbackId]
   );
 
   const fetchAndPlayRelatedNext = useCallback(async () => {
@@ -1775,7 +1786,7 @@ export function PlayerProvider({
           if (youtubeFallbackId) {
             youtubeBridgeRef.current?.play();
           } else {
-            void videoRef.current?.play().catch(() => {});
+            void getActiveMediaEl()?.play().catch(() => {});
           }
           setIsPlaying(true);
           syncMediaSessionMetadataNow(activeTrack, true, 0, activeTrack.duration, playbackRate);
@@ -1797,7 +1808,7 @@ export function PlayerProvider({
         if (youtubeFallbackId) {
           youtubeBridgeRef.current?.play();
         } else {
-          void videoRef.current?.play().catch(() => {});
+          void getActiveMediaEl()?.play().catch(() => {});
         }
         setIsPlaying(true);
         if (activeTrack) {
@@ -1830,6 +1841,7 @@ export function PlayerProvider({
   }, [
     autoplayRelated,
     fetchAndPlayRelatedNext,
+    getActiveMediaEl,
     loopMode,
     playbackRate,
     resetTrackLoadState,
@@ -1841,18 +1853,18 @@ export function PlayerProvider({
   const playPrevious = useCallback(() => {
     const prevQueue = queueRef.current;
     const activeIdx = currentIndexRef.current;
-    const video = videoRef.current;
+    const mediaEl = getActiveMediaEl();
     const activeTime =
-      !youtubeFallbackId && video && Number.isFinite(video.currentTime)
-        ? video.currentTime
+      !youtubeFallbackId && mediaEl && Number.isFinite(mediaEl.currentTime)
+        ? mediaEl.currentTime
         : currentTime;
     const action = getPreviousTrackAction(activeIdx, activeTime, prevQueue.length);
     if (action.action === 'restart') {
       seekTo(0);
       if (youtubeFallbackId) {
         youtubeBridgeRef.current?.play();
-      } else if (video && video.paused) {
-        void video.play().catch(() => {});
+      } else if (mediaEl && mediaEl.paused) {
+        void mediaEl.play().catch(() => {});
       }
       const activeTrack = activeIdx >= 0 ? prevQueue[activeIdx] : null;
       if (activeTrack) {
@@ -1869,6 +1881,7 @@ export function PlayerProvider({
     }
   }, [
     currentTime,
+    getActiveMediaEl,
     playbackRate,
     resetTrackLoadState,
     seekTo,
@@ -1880,6 +1893,9 @@ export function PlayerProvider({
     setPlaybackRateState(rate);
     if (videoRef.current) {
       videoRef.current.playbackRate = rate;
+    }
+    if (audioRef.current) {
+      audioRef.current.playbackRate = rate;
     }
     youtubeBridgeRef.current?.setPlaybackRate(rate);
   }, []);
@@ -1947,8 +1963,8 @@ export function PlayerProvider({
 
   const initEqualizer = useCallback(() => {
     setEqEnabled(true);
-    resumeEqualizerContext(videoRef.current, eqGains);
-  }, [eqGains]);
+    resumeEqualizerContext(getActiveMediaEl() as HTMLVideoElement | null, eqGains);
+  }, [eqGains, getActiveMediaEl]);
 
   const setEqBandGain = useCallback((bandIndex: number, gainDb: number) => {
     setEqEnabled(true);
@@ -1956,17 +1972,17 @@ export function PlayerProvider({
     setEqGains((prev) => {
       const next: EqGains = [...prev] as EqGains;
       next[bandIndex] = clamped;
-      applyEqualizerGains(videoRef.current, next);
+      applyEqualizerGains(getActiveMediaEl() as HTMLVideoElement | null, next);
       return next;
     });
-  }, []);
+  }, [getActiveMediaEl]);
 
   const applyEqPreset = useCallback((presetName: EqPresetName) => {
     setEqEnabled(true);
     const preset: EqGains = [...EQ_PRESETS[presetName]] as EqGains;
     setEqGains(preset);
-    applyEqualizerGains(videoRef.current, preset);
-  }, []);
+    applyEqualizerGains(getActiveMediaEl() as HTMLVideoElement | null, preset);
+  }, [getActiveMediaEl]);
 
   const playNextRef = useRef(playNext);
   playNextRef.current = playNext;
@@ -2006,17 +2022,19 @@ export function PlayerProvider({
     };
 
     setSafeHandler('play', () => {
+      shouldKeepPlayingInBackgroundRef.current = true;
       if (youtubeFallbackId) {
         youtubeBridgeRef.current?.play();
       } else {
-        void videoRef.current?.play().catch(() => {});
+        void getActiveMediaEl()?.play().catch(() => {});
       }
     });
     setSafeHandler('pause', () => {
+      shouldKeepPlayingInBackgroundRef.current = false;
       if (youtubeFallbackId) {
         youtubeBridgeRef.current?.pause();
       } else {
-        videoRef.current?.pause();
+        getActiveMediaEl()?.pause();
       }
     });
     setSafeHandler('seekbackward', (details) => {
@@ -2048,6 +2066,7 @@ export function PlayerProvider({
     };
   }, [
     currentTrack,
+    getActiveMediaEl,
     isPlaying,
     skipBy,
     seekTo,
@@ -2079,12 +2098,31 @@ export function PlayerProvider({
     }
   }, [currentTrack, duration, currentTime, playbackRate]);
 
-  // Keep background playback uninterrupted when switching apps or locking screen
+  // Keep background playback alive on iOS when screen locks or app enters background
   useEffect(() => {
     if (typeof document === 'undefined') {
       return;
     }
     const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        backgroundHiddenAtRef.current = Date.now();
+        // If playing video mode on iOS, WebKit may auto-pause <video>; nudge it back to playing
+        const mediaEl = getActiveMediaEl();
+        if (
+          shouldKeepPlayingInBackgroundRef.current &&
+          !youtubeFallbackId &&
+          mediaEl &&
+          mediaEl.paused &&
+          !mediaEl.ended
+        ) {
+          window.setTimeout(() => {
+            if (shouldKeepPlayingInBackgroundRef.current && mediaEl.paused && !mediaEl.ended) {
+              void mediaEl.play().catch(() => {});
+            }
+          }, 200);
+        }
+      }
+
       if (
         typeof navigator === 'undefined' ||
         !('mediaSession' in navigator) ||
@@ -2098,10 +2136,10 @@ export function PlayerProvider({
         Number.isFinite(duration) &&
         duration > 0
       ) {
-        const video = videoRef.current;
+        const mediaEl = getActiveMediaEl();
         const livePos =
-          !youtubeFallbackId && video && Number.isFinite(video.currentTime)
-            ? video.currentTime
+          !youtubeFallbackId && mediaEl && Number.isFinite(mediaEl.currentTime)
+            ? mediaEl.currentTime
             : currentTime;
         try {
           navigator.mediaSession.setPositionState({
@@ -2119,7 +2157,7 @@ export function PlayerProvider({
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [currentTrack, isPlaying, duration, currentTime, playbackRate, youtubeFallbackId]);
+  }, [currentTrack, getActiveMediaEl, isPlaying, duration, currentTime, playbackRate, youtubeFallbackId]);
 
   const scheduleStallRecovery = useCallback(() => {
     if (stallRecoveryTimerRef.current !== null || youtubeFallbackId) {
@@ -2127,8 +2165,8 @@ export function PlayerProvider({
     }
     stallRecoveryTimerRef.current = window.setTimeout(() => {
       stallRecoveryTimerRef.current = null;
-      const video = videoRef.current;
-      if (!video || video.paused || video.ended || youtubeFallbackId) {
+      const mediaEl = getActiveMediaEl();
+      if (!mediaEl || mediaEl.paused || mediaEl.ended || youtubeFallbackId) {
         return;
       }
 
@@ -2147,60 +2185,76 @@ export function PlayerProvider({
       }
 
       try {
-        if (Number.isFinite(video.currentTime)) {
-          video.currentTime = video.currentTime;
+        if (Number.isFinite(mediaEl.currentTime)) {
+          mediaEl.currentTime = mediaEl.currentTime;
         }
-        void video.play().catch(() => {});
+        void mediaEl.play().catch(() => {});
       } catch {
         // Ignore transient seek/play errors
       }
     }, STALL_RECOVERY_DELAY_MS);
-  }, [currentTrack, youtubeFallbackId]);
+  }, [currentTrack, getActiveMediaEl, youtubeFallbackId]);
 
   const handlePlay = () => {
     clearStallRecoveryTimer();
     stopBackgroundKeepAlive();
+    shouldKeepPlayingInBackgroundRef.current = true;
     setIsPlaying(true);
     setIsBuffering(false);
     setPlayerError(null);
   };
 
-  const handlePause = () => {
+  const handlePause = (e: React.SyntheticEvent<HTMLMediaElement>) => {
+    const el = e.currentTarget;
+    // If iOS WebKit auto-paused a <video> right as the app backgrounded, resume it once
+    if (
+      el === videoRef.current &&
+      document.visibilityState === 'hidden' &&
+      shouldKeepPlayingInBackgroundRef.current &&
+      Date.now() - backgroundHiddenAtRef.current < 1500
+    ) {
+      window.setTimeout(() => {
+        if (shouldKeepPlayingInBackgroundRef.current && el.paused && !el.ended) {
+          void el.play().catch(() => {});
+        }
+      }, 200);
+      return;
+    }
     clearStallRecoveryTimer();
     setIsPlaying(false);
   };
 
-  const handleTimeUpdate = () => {
-    const video = videoRef.current;
-    if (!video) {
+  const handleTimeUpdate = (e: React.SyntheticEvent<HTMLMediaElement>) => {
+    const mediaEl = e.currentTarget;
+    if (mediaEl !== getActiveMediaEl()) {
       return;
     }
-    if (Number.isFinite(video.currentTime)) {
-      if (Math.abs(video.currentTime - lastStallTimeRef.current) > 0.15) {
+    if (Number.isFinite(mediaEl.currentTime)) {
+      if (Math.abs(mediaEl.currentTime - lastStallTimeRef.current) > 0.15) {
         clearStallRecoveryTimer();
-        lastStallTimeRef.current = video.currentTime;
+        lastStallTimeRef.current = mediaEl.currentTime;
       }
-      setCurrentTime(video.currentTime);
+      setCurrentTime(mediaEl.currentTime);
     }
   };
 
-  const handleLoadedMetadata = () => {
-    const video = videoRef.current;
-    if (!video) {
+  const handleLoadedMetadata = (e: React.SyntheticEvent<HTMLMediaElement>) => {
+    const mediaEl = e.currentTarget;
+    if (mediaEl !== getActiveMediaEl()) {
       return;
     }
-    video.playbackRate = playbackRate;
-    video.loop = false;
-    if (Number.isFinite(video.duration) && video.duration > 0) {
-      setDuration(video.duration);
+    mediaEl.playbackRate = playbackRate;
+    mediaEl.loop = false;
+    if (Number.isFinite(mediaEl.duration) && mediaEl.duration > 0) {
+      setDuration(mediaEl.duration);
     }
     setIsBuffering(false);
   };
 
-  const tryStartTrackSynchronouslyOnVideo = useCallback(
+  const tryStartTrackSynchronouslyOnMedia = useCallback(
     (nextTrack: PlayableTrack): boolean => {
-      const video = videoRef.current;
-      if (!video || youtubeFallbackId) {
+      const mediaEl = getActiveMediaEl(nextTrack);
+      if (!mediaEl || youtubeFallbackId) {
         return false;
       }
 
@@ -2211,11 +2265,12 @@ export function PlayerProvider({
         activeObjectUrlRef.current = freshUrl;
         synchronousPreloadedRef.current = { trackId: nextTrack.id, src: freshUrl };
         activeStreamCacheKeyRef.current = null;
+        stopInactiveMediaEl(mediaEl);
         stopBackgroundKeepAlive();
-        video.src = freshUrl;
-        video.playbackRate = playbackRate;
-        video.loop = false;
-        void video.play().catch(() => {});
+        mediaEl.src = freshUrl;
+        mediaEl.playbackRate = playbackRate;
+        mediaEl.loop = false;
+        void mediaEl.play().catch(() => {});
         syncMediaSessionMetadataNow(nextTrack, true, 0, nextTrack.duration, playbackRate);
         return true;
       }
@@ -2248,19 +2303,22 @@ export function PlayerProvider({
       }
       synchronousPreloadedRef.current = { trackId: nextTrack.id, src: syncUrl };
       activeStreamCacheKeyRef.current = syncCacheKey;
+      stopInactiveMediaEl(mediaEl);
       stopBackgroundKeepAlive();
-      video.src = syncUrl;
-      video.playbackRate = playbackRate;
-      video.loop = false;
-      void video.play().catch(() => {});
+      mediaEl.src = syncUrl;
+      mediaEl.playbackRate = playbackRate;
+      mediaEl.loop = false;
+      void mediaEl.play().catch(() => {});
       syncMediaSessionMetadataNow(nextTrack, true, 0, nextTrack.duration, playbackRate);
       return true;
     },
     [
+      getActiveMediaEl,
       getCachedStreamForTrack,
       playbackRate,
       revokeActiveObjectUrl,
       stopBackgroundKeepAlive,
+      stopInactiveMediaEl,
       syncMediaSessionMetadataNow,
       youtubeFallbackId,
     ]
@@ -2268,6 +2326,7 @@ export function PlayerProvider({
 
   const handleEnded = useCallback(async () => {
     if (sleepTimerOption === 'end') {
+      shouldKeepPlayingInBackgroundRef.current = false;
       stopBackgroundKeepAlive();
       setSleepTimerOption('off');
       setSleepTimerRemainingSec(null);
@@ -2284,9 +2343,12 @@ export function PlayerProvider({
       if (youtubeFallbackId) {
         youtubeBridgeRef.current?.seekTo(0);
         youtubeBridgeRef.current?.play();
-      } else if (videoRef.current) {
-        videoRef.current.currentTime = 0;
-        void videoRef.current.play().catch(() => {});
+      } else {
+        const mediaEl = getActiveMediaEl();
+        if (mediaEl) {
+          mediaEl.currentTime = 0;
+          void mediaEl.play().catch(() => {});
+        }
       }
       setCurrentTime(0);
       setIsPlaying(true);
@@ -2310,9 +2372,12 @@ export function PlayerProvider({
           if (youtubeFallbackId) {
             youtubeBridgeRef.current?.seekTo(0);
             youtubeBridgeRef.current?.play();
-          } else if (videoRef.current) {
-            videoRef.current.currentTime = 0;
-            void videoRef.current.play().catch(() => {});
+          } else {
+            const mediaEl = getActiveMediaEl();
+            if (mediaEl) {
+              mediaEl.currentTime = 0;
+              void mediaEl.play().catch(() => {});
+            }
           }
           setCurrentTime(0);
           setIsPlaying(true);
@@ -2321,7 +2386,7 @@ export function PlayerProvider({
         }
 
         const wrappedTrack = prevQueue[firstManualIdx];
-        const startedSync = tryStartTrackSynchronouslyOnVideo(wrappedTrack);
+        const startedSync = tryStartTrackSynchronouslyOnMedia(wrappedTrack);
         if (!startedSync && !youtubeFallbackId) {
           startBackgroundKeepAlive();
         }
@@ -2339,9 +2404,12 @@ export function PlayerProvider({
         if (youtubeFallbackId) {
           youtubeBridgeRef.current?.seekTo(0);
           youtubeBridgeRef.current?.play();
-        } else if (videoRef.current) {
-          videoRef.current.currentTime = 0;
-          void videoRef.current.play().catch(() => {});
+        } else {
+          const mediaEl = getActiveMediaEl();
+          if (mediaEl) {
+            mediaEl.currentTime = 0;
+            void mediaEl.play().catch(() => {});
+          }
         }
         setCurrentTime(0);
         setIsPlaying(true);
@@ -2363,7 +2431,7 @@ export function PlayerProvider({
         targetTrack = promoted.track ?? { ...candidate, queueOrigin: 'manual' };
       }
 
-      const startedSync = tryStartTrackSynchronouslyOnVideo(targetTrack);
+      const startedSync = tryStartTrackSynchronouslyOnMedia(targetTrack);
       if (!startedSync && !youtubeFallbackId) {
         startBackgroundKeepAlive();
       }
@@ -2389,27 +2457,29 @@ export function PlayerProvider({
       stopBackgroundKeepAlive();
     }
 
+    shouldKeepPlayingInBackgroundRef.current = false;
     setIsPlaying(false);
   }, [
     loopMode,
     sleepTimerOption,
     autoplayRelated,
     currentTrack,
+    getActiveMediaEl,
     playbackRate,
     youtubeFallbackId,
     resetTrackLoadState,
     fetchAndPlayRelatedNext,
-    tryStartTrackSynchronouslyOnVideo,
+    tryStartTrackSynchronouslyOnMedia,
     startBackgroundKeepAlive,
     stopBackgroundKeepAlive,
     syncMediaSessionMetadataNow,
   ]);
 
-  const handleVideoError = useCallback(() => {
+  const handleMediaError = useCallback(() => {
     clearStallRecoveryTimer();
     stopBackgroundKeepAlive();
     if (activeStreamCacheKeyRef.current) {
-      (resolvedStreamCacheRef.current ??= new Map()).delete(activeStreamCacheKeyRef.current);
+      resolvedStreamCacheRef.current.delete(activeStreamCacheKeyRef.current);
       activeStreamCacheKeyRef.current = null;
     }
     if (!currentTrack) {
@@ -2447,10 +2517,11 @@ export function PlayerProvider({
     }
 
     const trackId = currentTrack.id;
-    let blockedSet = blockedYoutubeIdsRef.current.get(trackId);
+    const blockedMap = blockedYoutubeIdsRef.current;
+    let blockedSet = blockedMap.get(trackId);
     if (!blockedSet) {
       blockedSet = new Set<string>();
-      blockedYoutubeIdsRef.current.set(trackId, blockedSet);
+      blockedMap.set(trackId, blockedSet);
     }
     blockedSet.add(youtubeFallbackId);
 
@@ -2647,6 +2718,7 @@ export function PlayerProvider({
               preferredQuality={audioOnlyMode ? 'small' : 'default'}
               onPlay={() => {
                 stopBackgroundKeepAlive();
+                shouldKeepPlayingInBackgroundRef.current = true;
                 setIsPlaying(true);
                 setIsBuffering(false);
                 setPlayerError(null);
@@ -2713,12 +2785,51 @@ export function PlayerProvider({
                 clearStallRecoveryTimer();
                 void handleEnded();
               }}
-              onError={handleVideoError}
+              onError={handleMediaError}
             />
           )}
         </div>
       </div>
-      {/* Hidden silent keep-alive audio element to keep iOS WKWebView audio session alive during async track resolution */}
+
+      {/* Dedicated native <audio> element for Audio Mode & Radio (keeps iOS background audio active when locked) */}
+      <audio
+        ref={audioRef}
+        playsInline
+        crossOrigin={eqEnabled ? 'anonymous' : undefined}
+        preload="auto"
+        aria-hidden="true"
+        className="hidden"
+        onPlay={handlePlay}
+        onPause={handlePause}
+        onTimeUpdate={handleTimeUpdate}
+        onLoadedMetadata={handleLoadedMetadata}
+        onDurationChange={handleLoadedMetadata}
+        onWaiting={() => {
+          setIsBuffering(true);
+          scheduleStallRecovery();
+        }}
+        onStalled={() => {
+          setIsBuffering(true);
+          scheduleStallRecovery();
+        }}
+        onCanPlay={() => {
+          clearStallRecoveryTimer();
+          setIsBuffering(false);
+        }}
+        onPlaying={() => {
+          clearStallRecoveryTimer();
+          stopBackgroundKeepAlive();
+          setIsBuffering(false);
+          setIsPlaying(true);
+        }}
+        onEnded={() => {
+          clearStallRecoveryTimer();
+          void handleEnded();
+        }}
+        onError={handleMediaError}
+      />
+
+      {/* Hidden silent keep-alive audio element for async track transitions */}
       <audio
         ref={keepAliveAudioRef}
         loop
