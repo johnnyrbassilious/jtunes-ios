@@ -462,6 +462,7 @@ interface PlayerContextValue {
   audioOnlyMode: boolean;
   autoplayRelated: boolean;
   isExpanded: boolean;
+  isQueueOpen: boolean;
   isVideoFullscreen: boolean;
   isLyricsViewOpen: boolean;
   isPipActive: boolean;
@@ -494,6 +495,7 @@ interface PlayerContextValue {
   toggleAutoplayRelated: () => void;
   togglePictureInPicture: () => Promise<void>;
   setExpanded: (expanded: boolean) => void;
+  setQueueOpen: (open: boolean) => void;
   setVideoFullscreen: (fullscreen: boolean) => void;
   setLyricsViewOpen: (open: boolean) => void;
   stopAndClearCurrent: () => void;
@@ -528,9 +530,9 @@ export function PlayerProvider({
   const rollingEpochRef = useRef<number>(0);
   const lastRecordedTrackIdRef = useRef<string | null>(null);
   const loadNonceRef = useRef<number>(0);
-  const resolvedStreamCacheRef = useRef<Map<string, ResolvedStreamCacheEntry>>(new Map());
+  const resolvedStreamCacheRef = useRef>(new Map());
   const activeStreamCacheKeyRef = useRef<string | null>(null);
-  const blockedYoutubeIdsRef = useRef<Map<string, Set<string>>>(new Map());
+  const blockedYoutubeIdsRef = useRef>>(new Map());
   const embedRecoveryInFlightRef = useRef<boolean>(false);
   const stallRecoveryTimerRef = useRef<number | null>(null);
   const lastStallTimeRef = useRef<number>(0);
@@ -549,6 +551,7 @@ export function PlayerProvider({
   audioOnlyModeRef.current = audioOnlyMode;
 
   const [isExpanded, setExpanded] = useState(false);
+  const [isQueueOpen, setQueueOpen] = useState(false);
   const [isVideoFullscreen, setVideoFullscreen] = useState(false);
   const [isLyricsViewOpen, setLyricsViewOpen] = useState(false);
   const [isPipActive, setIsPipActive] = useState(false);
@@ -687,6 +690,9 @@ export function PlayerProvider({
   useEffect(() => {
     if (!isExpanded || audioOnlyMode || !currentTrack) {
       setVideoFullscreen(false);
+    }
+    if (!isExpanded) {
+      setQueueOpen(false);
     }
   }, [isExpanded, audioOnlyMode, currentTrack]);
 
@@ -1535,6 +1541,7 @@ export function PlayerProvider({
         setQueue([]);
         setCurrentIndex(-1);
         setExpanded(false);
+        setQueueOpen(false);
         setVideoFullscreen(false);
         setYoutubeFallbackId(null);
         syncMediaSessionMetadataNow(null, false);
@@ -1570,6 +1577,7 @@ export function PlayerProvider({
     setCurrentIndex(-1);
     resetTrackLoadState();
     setVideoFullscreen(false);
+    setQueueOpen(false);
     setExpanded(false);
     syncMediaSessionMetadataNow(null, false);
   }, [resetTrackLoadState, stopBackgroundKeepAlive, syncMediaSessionMetadataNow]);
@@ -1584,6 +1592,7 @@ export function PlayerProvider({
     setCurrentIndex(-1);
     resetTrackLoadState();
     setVideoFullscreen(false);
+    setQueueOpen(false);
     setExpanded(false);
     syncMediaSessionMetadataNow(null, false);
   }, [resetTrackLoadState, stopBackgroundKeepAlive, syncMediaSessionMetadataNow]);
@@ -2500,6 +2509,7 @@ export function PlayerProvider({
     audioOnlyMode,
     autoplayRelated,
     isExpanded,
+    isQueueOpen,
     isVideoFullscreen,
     isLyricsViewOpen,
     isPipActive,
@@ -2532,6 +2542,7 @@ export function PlayerProvider({
     toggleAutoplayRelated,
     togglePictureInPicture,
     setExpanded,
+    setQueueOpen,
     setVideoFullscreen,
     setLyricsViewOpen,
     stopAndClearCurrent,
@@ -2543,138 +2554,157 @@ export function PlayerProvider({
   };
 
   const showVideoStage =
-    isExpanded && currentTrack && !audioOnlyMode && (!isLyricsViewOpen || isVideoFullscreen);
+    isExpanded &&
+    currentTrack &&
+    !audioOnlyMode &&
+    !isQueueOpen &&
+    (!isLyricsViewOpen || isVideoFullscreen);
 
   return (
     <PlayerContext.Provider value={value}>
       {children}
       <div
         id="tubidy-persistent-video-anchor"
+        style={
+          showVideoStage && !isVideoFullscreen
+            ? { top: 'calc(env(safe-area-inset-top, 0px) + 74px)' }
+            : undefined
+        }
         className={
           isVideoFullscreen && showVideoStage
             ? 'fixed inset-0 z-[80] flex items-center justify-center bg-black p-2 sm:p-6 pointer-events-auto transition-opacity duration-200'
             : showVideoStage
-              ? 'fixed inset-x-0 top-[68px] z-[60] mx-auto flex h-[34vh] max-h-[340px] w-full max-w-2xl items-center justify-center px-5 pointer-events-auto transition-opacity duration-200'
+              ? 'fixed inset-x-0 z-[60] mx-auto flex h-[min(74vw,34dvh,290px)] w-full max-w-2xl items-center justify-center px-5 pointer-events-auto transition-opacity duration-200'
               : 'fixed bottom-0 left-0 h-px w-px overflow-hidden opacity-0 pointer-events-none'
         }
       >
-        {showVideoStage && !isVideoFullscreen && (
-          <button
-            type="button"
-            onClick={() => setVideoFullscreen(true)}
-            aria-label="Fullscreen video"
-            className="absolute bottom-2.5 right-7 z-[75] flex h-9 w-9 items-center justify-center rounded-full bg-zinc-950/80 text-zinc-100 ring-1 ring-white/20 backdrop-blur-md transition-transform hover:scale-105 hover:bg-zinc-900"
-          >
-            <Maximize2 size={16} />
-          </button>
-        )}
-
-        {isVideoFullscreen && showVideoStage && (
-          <div className="absolute right-4 top-4 z-[85] flex items-center gap-2 pt-safe">
-            {!youtubeFallbackId && (
-              <button
-                type="button"
-                onClick={() => void togglePictureInPicture()}
-                aria-label="Picture-in-Picture"
-                aria-pressed={isPipActive}
-                className={`flex h-10 w-10 items-center justify-center rounded-full backdrop-blur-md transition-colors ${
-                  isPipActive
-                    ? 'bg-accent text-white'
-                    : 'bg-zinc-900/80 text-zinc-100 ring-1 ring-white/15 hover:bg-zinc-800'
-                }`}
-              >
-                <PictureInPicture2 size={18} />
-              </button>
-            )}
+        <div
+          className={
+            isVideoFullscreen && showVideoStage
+              ? 'relative flex h-full w-full items-center justify-center'
+              : showVideoStage
+                ? 'relative aspect-video w-full max-h-full overflow-hidden rounded-2xl bg-black shadow-2xl ring-1 ring-zinc-800'
+                : 'h-px w-px overflow-hidden'
+          }
+        >
+          {showVideoStage && !isVideoFullscreen && (
             <button
               type="button"
-              onClick={() => setVideoFullscreen(false)}
-              aria-label="Exit fullscreen video"
-              className="flex h-10 w-10 items-center justify-center rounded-full bg-zinc-900/80 text-zinc-100 ring-1 ring-white/15 backdrop-blur-md hover:bg-zinc-800"
+              onClick={() => setVideoFullscreen(true)}
+              aria-label="Fullscreen video"
+              className="absolute bottom-2.5 right-2.5 z-[75] flex h-9 w-9 items-center justify-center rounded-full bg-zinc-950/80 text-zinc-100 ring-1 ring-white/20 backdrop-blur-md transition-transform hover:scale-105 hover:bg-zinc-900"
             >
-              <Minimize2 size={18} />
+              <Maximize2 size={16} />
             </button>
-          </div>
-        )}
+          )}
 
-        {youtubeFallbackId ? (
-          <YouTubePlayerBridge
-            ref={youtubeBridgeRef}
-            videoId={youtubeFallbackId}
-            playbackRate={playbackRate}
-            loop={loopMode === 'one' && sleepTimerOption !== 'end'}
-            preferredQuality={audioOnlyMode ? 'small' : 'default'}
-            onPlay={() => {
-              stopBackgroundKeepAlive();
-              setIsPlaying(true);
-              setIsBuffering(false);
-              setPlayerError(null);
-            }}
-            onPause={() => setIsPlaying(false)}
-            onBuffering={(buf) => setIsBuffering(buf)}
-            onTimeUpdate={(t, d) => {
-              setCurrentTime(t);
-              if (d > 0) {
-                setDuration(d);
+          {isVideoFullscreen && showVideoStage && (
+            <div className="absolute right-4 top-4 z-[85] flex items-center gap-2 pt-safe">
+              {!youtubeFallbackId && (
+                <button
+                  type="button"
+                  onClick={() => void togglePictureInPicture()}
+                  aria-label="Picture-in-Picture"
+                  aria-pressed={isPipActive}
+                  className={`flex h-10 w-10 items-center justify-center rounded-full backdrop-blur-md transition-colors ${
+                    isPipActive
+                      ? 'bg-accent text-white'
+                      : 'bg-zinc-900/80 text-zinc-100 ring-1 ring-white/15 hover:bg-zinc-800'
+                  }`}
+                >
+                  <PictureInPicture2 size={18} />
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setVideoFullscreen(false)}
+                aria-label="Exit fullscreen video"
+                className="flex h-10 w-10 items-center justify-center rounded-full bg-zinc-900/80 text-zinc-100 ring-1 ring-white/15 backdrop-blur-md hover:bg-zinc-800"
+              >
+                <Minimize2 size={18} />
+              </button>
+            </div>
+          )}
+
+          {youtubeFallbackId ? (
+            <YouTubePlayerBridge
+              ref={youtubeBridgeRef}
+              videoId={youtubeFallbackId}
+              playbackRate={playbackRate}
+              loop={loopMode === 'one' && sleepTimerOption !== 'end'}
+              preferredQuality={audioOnlyMode ? 'small' : 'default'}
+              onPlay={() => {
+                stopBackgroundKeepAlive();
+                setIsPlaying(true);
+                setIsBuffering(false);
+                setPlayerError(null);
+              }}
+              onPause={() => setIsPlaying(false)}
+              onBuffering={(buf) => setIsBuffering(buf)}
+              onTimeUpdate={(t, d) => {
+                setCurrentTime(t);
+                if (d > 0) {
+                  setDuration(d);
+                }
+              }}
+              onEnded={() => {
+                void handleEnded();
+              }}
+              onEmbedBlocked={() => {
+                void handleYouTubeEmbedBlocked();
+              }}
+              onError={() => {
+                stopBackgroundKeepAlive();
+                setIsPlaying(false);
+                setIsBuffering(false);
+                setPlayerError('Stream unavailable on this source.');
+              }}
+            />
+          ) : (
+            <video
+              ref={videoRef}
+              playsInline
+              crossOrigin={eqEnabled ? 'anonymous' : undefined}
+              preload="auto"
+              aria-label={currentTrack ? `Media player: ${currentTrack.title}` : 'Media player'}
+              className={
+                showVideoStage
+                  ? isVideoFullscreen
+                    ? 'h-full w-full rounded-xl bg-black object-contain'
+                    : 'h-full w-full bg-black object-contain'
+                  : 'h-px w-px'
               }
-            }}
-            onEnded={() => {
-              void handleEnded();
-            }}
-            onEmbedBlocked={() => {
-              void handleYouTubeEmbedBlocked();
-            }}
-            onError={() => {
-              stopBackgroundKeepAlive();
-              setIsPlaying(false);
-              setIsBuffering(false);
-              setPlayerError('Stream unavailable on this source.');
-            }}
-          />
-        ) : (
-          <video
-            ref={videoRef}
-            playsInline
-            crossOrigin={eqEnabled ? 'anonymous' : undefined}
-            preload="auto"
-            aria-label={currentTrack ? `Media player: ${currentTrack.title}` : 'Media player'}
-            className={
-              showVideoStage
-                ? isVideoFullscreen
-                  ? 'h-full w-full rounded-xl bg-black object-contain'
-                  : 'h-full w-full rounded-2xl bg-black object-contain shadow-2xl ring-1 ring-zinc-800'
-                : 'h-px w-px'
-            }
-            onPlay={handlePlay}
-            onPause={handlePause}
-            onTimeUpdate={handleTimeUpdate}
-            onLoadedMetadata={handleLoadedMetadata}
-            onDurationChange={handleLoadedMetadata}
-            onWaiting={() => {
-              setIsBuffering(true);
-              scheduleStallRecovery();
-            }}
-            onStalled={() => {
-              setIsBuffering(true);
-              scheduleStallRecovery();
-            }}
-            onCanPlay={() => {
-              clearStallRecoveryTimer();
-              setIsBuffering(false);
-            }}
-            onPlaying={() => {
-              clearStallRecoveryTimer();
-              stopBackgroundKeepAlive();
-              setIsBuffering(false);
-              setIsPlaying(true);
-            }}
-            onEnded={() => {
-              clearStallRecoveryTimer();
-              void handleEnded();
-            }}
-            onError={handleVideoError}
-          />
-        )}
+              onPlay={handlePlay}
+              onPause={handlePause}
+              onTimeUpdate={handleTimeUpdate}
+              onLoadedMetadata={handleLoadedMetadata}
+              onDurationChange={handleLoadedMetadata}
+              onWaiting={() => {
+                setIsBuffering(true);
+                scheduleStallRecovery();
+              }}
+              onStalled={() => {
+                setIsBuffering(true);
+                scheduleStallRecovery();
+              }}
+              onCanPlay={() => {
+                clearStallRecoveryTimer();
+                setIsBuffering(false);
+              }}
+              onPlaying={() => {
+                clearStallRecoveryTimer();
+                stopBackgroundKeepAlive();
+                setIsBuffering(false);
+                setIsPlaying(true);
+              }}
+              onEnded={() => {
+                clearStallRecoveryTimer();
+                void handleEnded();
+              }}
+              onError={handleVideoError}
+            />
+          )}
+        </div>
       </div>
       {/* Hidden silent keep-alive audio element to keep iOS WKWebView audio session alive during async track resolution */}
       <audio
