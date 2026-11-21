@@ -564,9 +564,9 @@ export function PlayerProvider({
   const rollingEpochRef = useRef<number>(0);
   const lastRecordedTrackIdRef = useRef<string | null>(null);
   const loadNonceRef = useRef<number>(0);
-  const resolvedStreamCacheRef = useRef>(new Map());
+  const resolvedStreamCacheRef = useRef(new Map() as any);
   const activeStreamCacheKeyRef = useRef<string | null>(null);
-  const blockedYoutubeIdsRef = useRef>>(new Map());
+  const blockedYoutubeIdsRef = useRef(new Map() as any);
   const embedRecoveryInFlightRef = useRef<boolean>(false);
   const stallRecoveryTimerRef = useRef<number | null>(null);
   const lastStallTimeRef = useRef<number>(0);
@@ -769,12 +769,12 @@ export function PlayerProvider({
       const trackKey = ytId || targetUrl;
       const cacheKey = buildStreamCacheKey(trackKey, requestMode, quality);
 
-      const cached = resolvedStreamCacheRef.current.get(cacheKey);
+      const cached = (resolvedStreamCacheRef.current ??= new Map()).get(cacheKey);
       if (cached && cached.expiresAt > Date.now()) {
         return { entry: cached, cacheKey };
       }
       if (cached) {
-        resolvedStreamCacheRef.current.delete(cacheKey);
+        (resolvedStreamCacheRef.current ??= new Map()).delete(cacheKey);
       }
 
       const slowNetwork = isSlowNetworkConnection();
@@ -789,7 +789,7 @@ export function PlayerProvider({
           signal
         );
         if (nativeEntry && !signal?.aborted) {
-          resolvedStreamCacheRef.current.set(cacheKey, nativeEntry);
+          (resolvedStreamCacheRef.current ??= new Map()).set(cacheKey, nativeEntry);
           return { entry: nativeEntry, cacheKey };
         }
       }
@@ -810,7 +810,7 @@ export function PlayerProvider({
           mime: requestMode === 'audio' ? 'audio/mp4' : 'video/mp4',
           expiresAt: computeStreamExpiry(result.directUrl),
         };
-        resolvedStreamCacheRef.current.set(cacheKey, entry);
+        (resolvedStreamCacheRef.current ??= new Map()).set(cacheKey, entry);
         return { entry, cacheKey };
       }
 
@@ -842,12 +842,12 @@ export function PlayerProvider({
 
       const now = Date.now();
       for (const key of candidateKeys) {
-        const cached = resolvedStreamCacheRef.current.get(key);
+        const cached = (resolvedStreamCacheRef.current ??= new Map()).get(key);
         if (cached && cached.expiresAt > now) {
           return { entry: cached, cacheKey: key };
         }
         if (cached) {
-          resolvedStreamCacheRef.current.delete(key);
+          (resolvedStreamCacheRef.current ??= new Map()).delete(key);
         }
       }
       return null;
@@ -1100,7 +1100,7 @@ export function PlayerProvider({
     const nextMode = getEffectiveRequestMode(nextTrack, audioOnlyMode, slowNetwork);
     const trackKey = ytId || targetUrl;
     const cacheKey = buildStreamCacheKey(trackKey, nextMode, defaultQuality);
-    const existing = resolvedStreamCacheRef.current.get(cacheKey);
+    const existing = (resolvedStreamCacheRef.current ??= new Map()).get(cacheKey);
     if (existing && existing.expiresAt > Date.now()) {
       return;
     }
@@ -2409,7 +2409,7 @@ export function PlayerProvider({
     clearStallRecoveryTimer();
     stopBackgroundKeepAlive();
     if (activeStreamCacheKeyRef.current) {
-      resolvedStreamCacheRef.current.delete(activeStreamCacheKeyRef.current);
+      (resolvedStreamCacheRef.current ??= new Map()).delete(activeStreamCacheKeyRef.current);
       activeStreamCacheKeyRef.current = null;
     }
     if (!currentTrack) {

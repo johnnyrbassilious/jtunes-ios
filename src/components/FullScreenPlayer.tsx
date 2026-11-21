@@ -123,7 +123,7 @@ export function FullScreenPlayer() {
   const activeLyricRef = useRef<HTMLButtonElement | null>(null);
   const queueScrollContainerRef = useRef<HTMLDivElement | null>(null);
   const nowPlayingSectionRef = useRef<HTMLDivElement | null>(null);
-  const nowPlayingRowElsRef = useRef>(new Map());
+  const nowPlayingRowElsRef = useRef(new Map() as any);
   const nowPlayingCentersRef = useRef<Array<{ idx: number; centerY: number; height: number }>>([]);
   const queueDragRef = useRef<{
     pointerId: number;
