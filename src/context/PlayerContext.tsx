@@ -83,7 +83,7 @@ interface NetworkInformationLike {
 }
 
 interface NativeInnertubeProfile {
-  name: 'ANDROID_VR' | 'IOS';
+  name: 'VISIONOS' | 'ANDROID_VR' | 'IOS';
   userAgent: string;
   clientNameHeader: string;
   clientVersion: string;
@@ -92,14 +92,31 @@ interface NativeInnertubeProfile {
 
 const NATIVE_IOS_INNERTUBE_PROFILES: readonly NativeInnertubeProfile[] = [
   {
+    name: 'VISIONOS',
+    userAgent:
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15',
+    clientNameHeader: '101',
+    clientVersion: '1.02',
+    clientPayload: {
+      clientName: 'VISIONOS',
+      clientVersion: '1.02',
+      deviceMake: 'Apple',
+      deviceModel: 'RealityDevice17,1',
+      osName: 'visionOS',
+      osVersion: '26.5.23O471',
+      hl: 'en',
+      gl: 'US',
+    },
+  },
+  {
     name: 'ANDROID_VR',
     userAgent:
-      'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+      'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
     clientNameHeader: '28',
-    clientVersion: '1.60.19',
+    clientVersion: '1.65.10',
     clientPayload: {
       clientName: 'ANDROID_VR',
-      clientVersion: '1.60.19',
+      clientVersion: '1.65.10',
       deviceMake: 'Oculus',
       deviceModel: 'Quest 3',
       androidSdkVersion: 32,
@@ -112,16 +129,16 @@ const NATIVE_IOS_INNERTUBE_PROFILES: readonly NativeInnertubeProfile[] = [
   {
     name: 'IOS',
     userAgent:
-      'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)',
+      'com.google.ios.youtube/20.11.6 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
     clientNameHeader: '5',
-    clientVersion: '19.45.4',
+    clientVersion: '20.11.6',
     clientPayload: {
       clientName: 'IOS',
-      clientVersion: '19.45.4',
+      clientVersion: '20.11.6',
       deviceMake: 'Apple',
       deviceModel: 'iPhone16,2',
       osName: 'iPhone',
-      osVersion: '18.1.0.22B83',
+      osVersion: '18.3.2.22D82',
       hl: 'en',
       gl: 'US',
     },
@@ -316,6 +333,10 @@ function pickNativeIosStreamingFormat(
   const adaptiveFormats = Array.isArray(streamingData.adaptiveFormats)
     ? (streamingData.adaptiveFormats as Array<Record<string, unknown>>)
     : [];
+  const hlsManifestUrl =
+    typeof streamingData.hlsManifestUrl === 'string' && streamingData.hlsManifestUrl.length > 0
+      ? streamingData.hlsManifestUrl
+      : null;
 
   if (mode === 'audio') {
     const allAudio = [...adaptiveFormats, ...formats].filter((f) => {
@@ -343,6 +364,10 @@ function pickNativeIosStreamingFormat(
         mime: rawMime.split(';')[0].trim() || 'audio/mp4',
       };
     }
+    if (hlsManifestUrl) {
+      return { url: hlsManifestUrl, mime: 'application/x-mpegURL' };
+    }
+    return null;
   }
 
   const desiredHeight = Number.parseInt(quality, 10) || 720;
@@ -367,6 +392,11 @@ function pickNativeIosStreamingFormat(
       url: String(chosen.url),
       mime: rawMime.split(';')[0].trim() || 'video/mp4',
     };
+  }
+
+  // Native iOS AVPlayer / WKWebView plays HLS manifests directly with full HD video + audio + PiP + background audio
+  if (hlsManifestUrl) {
+    return { url: hlsManifestUrl, mime: 'application/x-mpegURL' };
   }
 
   return null;
@@ -414,6 +444,10 @@ async function resolveNativeIosInnertubeStream(
         typeof resp.data === 'string'
           ? (JSON.parse(resp.data) as Record<string, unknown>)
           : (resp.data as Record<string, unknown>);
+      const playability = parsed.playabilityStatus as Record<string, unknown> | undefined;
+      if (playability?.status && playability.status !== 'OK') {
+        continue;
+      }
       const streamingData = parsed.streamingData as Record<string, unknown> | undefined;
       if (!streamingData || typeof streamingData !== 'object') {
         continue;
@@ -745,7 +779,7 @@ export function PlayerProvider({
 
       const slowNetwork = isSlowNetworkConnection();
 
-      // 1. Native iOS CapacitorHttp direct InnerTube resolution (zero iframe embed blocks & full background audio)
+      // 1. Native iOS CapacitorHttp direct VISIONOS InnerTube resolution (zero iframe blocks + full background audio)
       if (ytId && getNativeCapacitorHttp()) {
         const nativeEntry = await resolveNativeIosInnertubeStream(
           ytId,
@@ -764,7 +798,7 @@ export function PlayerProvider({
         return { entry: null, cacheKey };
       }
 
-      // 2. Backend /api/resolve-stream race
+      // 2. Backend /api/resolve-stream fallback
       const result = await resolveStream(backendUrl, targetUrl, requestMode, quality, {
         timeoutMs,
         signal,
@@ -985,7 +1019,7 @@ export function PlayerProvider({
       }
       if (resolved.entry) {
         activeStreamCacheKeyRef.current = resolved.cacheKey;
-        // Native audio/video stream succeeded: keep YouTubePlayerBridge unmounted to save data
+        // Native audio/video stream succeeded: keep YouTubePlayerBridge unmounted for background audio & data savings
         setYoutubeFallbackId(null);
         setOverrideStreamUrl(resolved.entry.url);
         return;
@@ -1024,7 +1058,7 @@ export function PlayerProvider({
     onListenHistoryUpdated,
   ]);
 
-  // Silent background pre-resolution for the NEXT track (queue[currentIndex + 1] or wrap-around target) for zero-gap iOS transitions
+  // Silent background pre-resolution for the NEXT track for zero-gap iOS transitions
   useEffect(() => {
     if (currentIndex < 0 || queue.length === 0) {
       return;
@@ -1130,7 +1164,6 @@ export function PlayerProvider({
           }
           kept.push(item);
         } else if (idx === activeIdx && activeId && item.id === activeId) {
-          // Preserve the currently active song by promoting it to manual so playback doesn't cut off mid-song
           computedIdx = kept.length;
           kept.push({ ...item, queueOrigin: 'manual' });
         }
@@ -1143,11 +1176,10 @@ export function PlayerProvider({
       return;
     }
 
-    // Turned ON: clear last seed so rolling autoplay immediately fetches related tracks
     lastRollingSeedIdRef.current = null;
   }, [autoplayRelated]);
 
-  // Proactive Rolling Autoplay: refill whenever <= 4 upcoming tracks remain, seeded from the LAST track in queue
+  // Proactive Rolling Autoplay
   useEffect(() => {
     if (
       !autoplayRelated ||
@@ -1320,7 +1352,6 @@ export function PlayerProvider({
     setPlayerError(null);
   }, [clearStallRecoveryTimer]);
 
-  // Direct track tap from Search or Library: completely reset queue to [newTrack] (zero ghost tracks)
   const playTrack = useCallback(
     (track: PlayableTrack) => {
       resetTrackLoadState();
@@ -1399,7 +1430,6 @@ export function PlayerProvider({
     [playbackRate, resetTrackLoadState, syncMediaSessionMetadataNow]
   );
 
-  // Insert track immediately at queueIndex + 1 strictly inside Now Playing (before any autoplay items)
   const playNextInQueue = useCallback(
     (track: PlayableTrack) => {
       const manualTrack: PlayableTrack = { ...track, queueOrigin: 'manual' };
@@ -1428,7 +1458,6 @@ export function PlayerProvider({
     [playbackRate, resetTrackLoadState, syncMediaSessionMetadataNow]
   );
 
-  // Insert track immediately after the LAST non-autoplay item (bottom of Now Playing, strictly before Autoplay)
   const addToQueue = useCallback(
     (track: PlayableTrack) => {
       const manualTrack: PlayableTrack = { ...track, queueOrigin: 'manual' };
@@ -1450,7 +1479,6 @@ export function PlayerProvider({
       const existingIdx = prev.findIndex((t) => t.id === manualTrack.id);
       if (existingIdx !== -1) {
         if (!isAutoplayTrack(prev[existingIdx])) {
-          // Already in Now Playing; preserve strict invariant without duplicating
           const normalized = enforceQueueOrderInvariant(prev, activeIdx);
           setQueue(normalized.queue);
           if (normalized.currentIndex !== activeIdx) {
@@ -1458,7 +1486,6 @@ export function PlayerProvider({
           }
           return;
         }
-        // Promote existing autoplay item to the bottom of Now Playing right before remaining autoplay items
         const withoutExisting = prev.filter((_, idx) => idx !== existingIdx);
         const adjustedActiveIdx =
           existingIdx < activeIdx ? Math.max(0, activeIdx - 1) : activeIdx;
@@ -1484,7 +1511,6 @@ export function PlayerProvider({
         return;
       }
 
-      // New track: insert immediately after the LAST manual track (strictly before the first autoplay item)
       const firstAutoIdx = prev.findIndex((t) => isAutoplayTrack(t));
       const inserted =
         firstAutoIdx === -1
@@ -1499,7 +1525,6 @@ export function PlayerProvider({
     [playbackRate, resetTrackLoadState, syncMediaSessionMetadataNow]
   );
 
-  // Reorder tracks cleanly within Now Playing while keeping currentIndex pointed at the active track
   const reorderQueueItem = useCallback((fromIndex: number, toIndex: number) => {
     const prev = queueRef.current;
     const activeIdx = currentIndexRef.current;
@@ -1707,7 +1732,6 @@ export function PlayerProvider({
         isLiveRadio: item.isLiveRadio,
         mode: item.mediaType ?? targetMode,
         isOffline: false,
-        // Promote the track about to start playing directly into Now Playing
         queueOrigin: idx === 0 ? 'manual' : 'auto',
       }));
 
@@ -1869,7 +1893,6 @@ export function PlayerProvider({
     audioOnlyModeRef.current = nextAudioOnly;
     setAudioOnlyMode(nextAudioOnly);
 
-    // Re-resolve active online track in true audio-only vs video mode to save bandwidth or upgrade to video
     if (currentTrack && !currentTrack.isOffline && !currentTrack.isLiveRadio) {
       resetTrackLoadState();
       setQueue((prev) =>
@@ -2056,7 +2079,7 @@ export function PlayerProvider({
     }
   }, [currentTrack, duration, currentTime, playbackRate]);
 
-  // Keep background playback uninterrupted when switching apps or locking screen (never pause on visibilitychange)
+  // Keep background playback uninterrupted when switching apps or locking screen
   useEffect(() => {
     if (typeof document === 'undefined') {
       return;
@@ -2109,7 +2132,6 @@ export function PlayerProvider({
         return;
       }
 
-      // On slow networks currently playing video, downgrade to audio-only stream for stability
       if (
         isSlowNetworkConnection() &&
         !audioOnlyModeRef.current &&
@@ -2124,7 +2146,6 @@ export function PlayerProvider({
         return;
       }
 
-      // Re-nudge stalled HTML5 playback buffer
       try {
         if (Number.isFinite(video.currentTime)) {
           video.currentTime = video.currentTime;
@@ -2176,7 +2197,6 @@ export function PlayerProvider({
     setIsBuffering(false);
   };
 
-  // Attempt to start the next track synchronously on <video> inside `ended` so iOS WKWebView never suspends the audio session
   const tryStartTrackSynchronouslyOnVideo = useCallback(
     (nextTrack: PlayableTrack): boolean => {
       const video = videoRef.current;
@@ -2246,9 +2266,7 @@ export function PlayerProvider({
     ]
   );
 
-  // Auto-advance queue, support 3-state Loop ('off' | 'all' | 'one'), Sleep Timer ('end'), or Related Media
   const handleEnded = useCallback(async () => {
-    // Sleep timer 'end' stops after current track finishes
     if (sleepTimerOption === 'end') {
       stopBackgroundKeepAlive();
       setSleepTimerOption('off');
@@ -2262,7 +2280,6 @@ export function PlayerProvider({
     const activeTrack =
       activeIdx >= 0 && activeIdx < prevQueue.length ? prevQueue[activeIdx] : currentTrack;
 
-    // Continuous Loop Current Track ('one'): never auto-disable after 1 repeat
     if (loopMode === 'one') {
       if (youtubeFallbackId) {
         youtubeBridgeRef.current?.seekTo(0);
@@ -2279,7 +2296,6 @@ export function PlayerProvider({
       return;
     }
 
-    // Loop Queue ('all'): when the last track in Now Playing finishes, wrap smoothly to index 0 of Now Playing
     if (loopMode === 'all' && activeTrack && !isAutoplayTrack(activeTrack)) {
       const firstManualIdx = prevQueue.findIndex((t) => !isAutoplayTrack(t));
       let lastManualIdx = -1;
@@ -2363,7 +2379,6 @@ export function PlayerProvider({
     }
 
     if (autoplayRelated && activeTrack && !activeTrack.isLiveRadio) {
-      // Keep iOS background audio session alive during the brief related-track network fetch
       if (!youtubeFallbackId) {
         startBackgroundKeepAlive();
       }
@@ -2390,7 +2405,6 @@ export function PlayerProvider({
     syncMediaSessionMetadataNow,
   ]);
 
-  // Immediate YouTubePlayerBridge fallback on <video> error for YouTube tracks
   const handleVideoError = useCallback(() => {
     clearStallRecoveryTimer();
     stopBackgroundKeepAlive();
@@ -2427,7 +2441,6 @@ export function PlayerProvider({
     setPlayerError('Could not load this stream. Check server URL in Settings.');
   }, [clearStallRecoveryTimer, stopBackgroundKeepAlive, currentTrack, overrideStreamUrl]);
 
-  // Auto-recover from embed-restricted YouTube videos (error 101 / 150) by silently playing an alternate upload
   const handleYouTubeEmbedBlocked = useCallback(async () => {
     if (!currentTrack || !youtubeFallbackId || embedRecoveryInFlightRef.current) {
       return;
@@ -2441,7 +2454,6 @@ export function PlayerProvider({
     }
     blockedSet.add(youtubeFallbackId);
 
-    // If an alternate upload was already attempted and also failed, surface a brief error
     if (blockedSet.size >= 2) {
       setIsPlaying(false);
       setIsBuffering(false);
