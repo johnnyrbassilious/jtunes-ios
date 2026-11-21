@@ -1,3 +1,4 @@
+import { Capacitor, CapacitorHttp } from '@capacitor/core';
 import type { MediaFormatMode } from '../types/media';
 import { DEFAULT_BACKEND_URL, resolveStream } from './api';
 import { normalizeBackendUrl } from './formatters';
@@ -115,78 +116,6 @@ async function readResponseWithProgress(
   return { bytes: concatChunks(parts), totalBytes: effectiveTotal };
 }
 
-function pickPipedStreamUrl(
-  payload: Record<string, unknown>,
-  mode: MediaFormatMode,
-  quality: string
-): string | null {
-  if (mode === 'audio') {
-    const audioStreams = Array.isArray(payload.audioStreams)
-      ? (payload.audioStreams as Array<Record<string, unknown>>)
-      : [];
-    const sorted = [...audioStreams]
-      .filter((s) => typeof s.url === 'string' && s.url.length > 0)
-      .sort((a, b) => Number(b.bitrate ?? 0) - Number(a.bitrate ?? 0));
-    if (sorted.length > 0) {
-      return String(sorted[0].url);
-    }
-  }
-
-  const videoStreams = Array.isArray(payload.videoStreams)
-    ? (payload.videoStreams as Array<Record<string, unknown>>)
-    : [];
-  const progressive = videoStreams.filter(
-    (s) => typeof s.url === 'string' && s.url.length > 0 && s.videoOnly !== true
-  );
-  if (progressive.length > 0) {
-    const desired = Number.parseInt(quality, 10) || 720;
-    const match =
-      progressive.find((s) => String(s.quality || '').includes(String(desired))) ??
-      progressive[0];
-    return String(match.url);
-  }
-
-  return null;
-}
-
-async function resolvePublicFallbackUrls(
-  videoId: string,
-  mode: MediaFormatMode,
-  quality: string,
-  signal: AbortSignal,
-  fetchImpl: typeof fetch
-): Promise<string[]> {
-  const candidates: string[] = [];
-  const pipedHosts = ['https://pipedapi.kavin.rocks', 'https://api.piped.private.coffee'];
-
-  for (const host of pipedHosts) {
-    if (signal.aborted) {
-      break;
-    }
-    try {
-      const resp = await fetchImpl(`${host}/streams/${encodeURIComponent(videoId)}`, {
-        signal,
-      });
-      if (resp.ok) {
-        const json = (await resp.json()) as Record<string, unknown>;
-        const resolved = pickPipedStreamUrl(json, mode, quality);
-        if (resolved) {
-          candidates.push(resolved);
-        }
-      }
-    } catch {
-      // Try next public endpoint
-    }
-  }
-
-  const itag = mode === 'audio' ? '140' : '18';
-  candidates.push(
-    `https://inv.nadeko.net/latest_version?id=${encodeURIComponent(videoId)}&itag=${itag}&local=true`
-  );
-
-  return candidates;
-}
-
 async function downloadFromDirectCandidate(
   url: string,
   signal: AbortSignal,
@@ -203,7 +132,7 @@ async function downloadFromDirectCandidate(
     if (ct && (ct.includes('application/json') || ct.includes('text/html'))) {
       return null;
     }
-    const mimeType = ct || fallbackMime;
+    const mimeType = ct ? ct.split(';')[0].trim() || fallbackMime : fallbackMime;
     const { bytes } = await readResponseWithProgress(resp, 0, null, 1, onProgress);
     if (bytes.byteLength === 0) {
       return null;
@@ -222,144 +151,6 @@ async function downloadFromDirectCandidate(
   }
 }
 
-async function sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) {
-    throw new DOMException('Download aborted', 'AbortError');
-  }
-  if (ms <= 0) {
-    return;
-  }
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      signal.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(new DOMException('Download aborted', 'AbortError'));
-    };
-    signal.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
-async function downloadViaLoaderFallback(
-  targetUrl: string,
-  mode: MediaFormatMode,
-  quality: string,
-  signal: AbortSignal,
-  onProgress: (progress: ChunkDownloadProgress) => void,
-  fetchImpl: typeof fetch,
-  fallbackMime: string,
-  pollIntervalMs = 1200
-): Promise<ChunkDownloadResult | null> {
-  const formatParam = mode === 'audio' ? 'mp3' : quality || '720';
-  const initUrl = `https://ab.cococococ.com/ajax/download.php?copyright=0&format=${encodeURIComponent(
-    formatParam
-  )}&url=${encodeURIComponent(targetUrl)}&api=dfcb6d76f2f6a9894gjkege8a4ab232222`;
-
-  try {
-    const initResp = await fetchImpl(initUrl, { signal });
-    if (!initResp.ok) {
-      return null;
-    }
-    const initData = (await initResp.json()) as Record<string, unknown>;
-    const taskId = typeof initData.id === 'string' || typeof initData.id === 'number'
-      ? String(initData.id).trim()
-      : '';
-    if (!taskId) {
-      return null;
-    }
-
-    let downloadUrl =
-      typeof initData.download_url === 'string' && initData.download_url
-        ? initData.download_url
-        : '';
-
-    const maxPolls = 60;
-    for (let attempt = 0; attempt < maxPolls && !downloadUrl; attempt += 1) {
-      if (signal.aborted) {
-        throw new DOMException('Download aborted', 'AbortError');
-      }
-      if (attempt > 0) {
-        await sleepWithAbort(pollIntervalMs, signal);
-      }
-      const pollResp = await fetchImpl(
-        `https://p.oceansaver.in/ajax/progress.php?id=${encodeURIComponent(taskId)}`,
-        { signal }
-      );
-      if (!pollResp.ok) {
-        continue;
-      }
-      const pollData = (await pollResp.json()) as Record<string, unknown>;
-      const rawProgress = Number(pollData.progress ?? 0);
-      if (Number.isFinite(rawProgress) && rawProgress >= 0) {
-        const normalizedPct =
-          rawProgress > 100
-            ? Math.min(99, Math.round(rawProgress / 10))
-            : Math.min(99, Math.round(rawProgress));
-        onProgress({
-          receivedBytes: 0,
-          totalBytes: null,
-          progress: normalizedPct,
-          chunkIndex: 1,
-        });
-      }
-      if (typeof pollData.download_url === 'string' && pollData.download_url.startsWith('http')) {
-        downloadUrl = pollData.download_url;
-        break;
-      }
-      const textStatus = typeof pollData.text === 'string' ? pollData.text.toLowerCase() : '';
-      if (textStatus.includes('error') || textStatus.includes('failed')) {
-        break;
-      }
-    }
-
-    if (!downloadUrl) {
-      return null;
-    }
-
-    const expectedMime = mode === 'audio' ? 'audio/mpeg' : fallbackMime;
-    return await downloadFromDirectCandidate(
-      downloadUrl,
-      signal,
-      onProgress,
-      fetchImpl,
-      expectedMime
-    );
-  } catch (err) {
-    if (signal.aborted || (err instanceof Error && err.name === 'AbortError')) {
-      throw err;
-    }
-    return null;
-  }
-}
-
-interface CapacitorHttpLike {
-  post: (options: {
-    url: string;
-    headers?: Record<string, string>;
-    data?: unknown;
-  }) => Promise<{ status: number; data: unknown }>;
-  get?: (options: {
-    url: string;
-    headers?: Record<string, string>;
-    responseType?: 'blob' | 'arraybuffer' | 'text' | 'json';
-  }) => Promise<{
-    status: number;
-    data: unknown;
-    headers?: Record<string, string>;
-  }>;
-}
-
-interface CapacitorWindow {
-  Capacitor?: {
-    isNativePlatform?: () => boolean;
-    Plugins?: {
-      CapacitorHttp?: CapacitorHttpLike;
-    };
-  };
-}
-
 function decodeCapacitorBinaryData(data: unknown): Uint8Array | null {
   if (!data) {
     return null;
@@ -372,9 +163,11 @@ function decodeCapacitorBinaryData(data: unknown): Uint8Array | null {
   }
   if (typeof data === 'string' && data.length > 0) {
     try {
-      const cleaned = data.includes(',') && data.startsWith('data:')
+      const stripped = data.includes(',') && data.startsWith('data:')
         ? data.slice(data.indexOf(',') + 1)
         : data;
+      // Strip whitespace/newlines and normalize URL-safe base64 from iOS native bridge
+      const cleaned = stripped.replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
       const binary = atob(cleaned);
       const out = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i += 1) {
@@ -565,14 +358,11 @@ async function downloadBinaryWithCapacitorHttp(
   userAgent: string | undefined,
   signal: AbortSignal,
   onProgress: (progress: ChunkDownloadProgress) => void,
-  capacitorHttp: CapacitorHttpLike
+  errorsOut: string[]
 ): Promise<ChunkDownloadResult | null> {
-  if (typeof capacitorHttp.get !== 'function') {
-    return null;
-  }
-
   const baseHeaders: Record<string, string> = userAgent ? { 'User-Agent': userAgent } : {};
 
+  // Use 2.5 MB Range chunks when contentLength is known so the native bridge stays fast and shows progress
   if (contentLength && contentLength > CHUNK_SIZE_BYTES) {
     const chunks: Uint8Array[] = [];
     let offset = 0;
@@ -584,20 +374,22 @@ async function downloadBinaryWithCapacitorHttp(
         throw new DOMException('Download aborted', 'AbortError');
       }
       const endByte = Math.min(offset + CHUNK_SIZE_BYTES - 1, contentLength - 1);
-      const chunkResp = await capacitorHttp.get({
+      const chunkResp = await CapacitorHttp.get({
         url,
         headers: {
           ...baseHeaders,
           Range: `bytes=${offset}-${endByte}`,
         },
-        responseType: 'arraybuffer',
+        responseType: 'blob',
       });
       if (chunkResp.status < 200 || chunkResp.status >= 300) {
+        errorsOut.push(`chunkHTTP:${chunkResp.status}`);
         rangeFailed = true;
         break;
       }
       const bytes = decodeCapacitorBinaryData(chunkResp.data);
       if (!bytes || bytes.byteLength === 0) {
+        errorsOut.push('chunkDecodeEmpty');
         rangeFailed = true;
         break;
       }
@@ -631,10 +423,11 @@ async function downloadBinaryWithCapacitorHttp(
     }
   }
 
-  const binResp = await capacitorHttp.get({
+  // Single-shot native download fallback
+  const binResp = await CapacitorHttp.get({
     url,
     headers: baseHeaders,
-    responseType: 'arraybuffer',
+    responseType: 'blob',
   });
   if (signal.aborted) {
     throw new DOMException('Download aborted', 'AbortError');
@@ -643,6 +436,7 @@ async function downloadBinaryWithCapacitorHttp(
     const headerCt =
       binResp.headers?.['content-type'] ?? binResp.headers?.['Content-Type'] ?? '';
     if (headerCt && (headerCt.includes('text/html') || headerCt.includes('application/json'))) {
+      errorsOut.push(`badCT:${headerCt}`);
       return null;
     }
     const resolvedMime = headerCt ? headerCt.split(';')[0].trim() || mimeType : mimeType;
@@ -661,6 +455,9 @@ async function downloadBinaryWithCapacitorHttp(
         sizeBytes: blob.size,
       };
     }
+    errorsOut.push('singleDecodeEmpty');
+  } else {
+    errorsOut.push(`singleHTTP:${binResp.status}`);
   }
 
   return null;
@@ -672,8 +469,7 @@ async function downloadViaNativeCapacitorIos(
   quality: string,
   signal: AbortSignal,
   onProgress: (progress: ChunkDownloadProgress) => void,
-  fetchImpl: typeof fetch,
-  capacitorHttp: CapacitorHttpLike
+  errorsOut: string[]
 ): Promise<ChunkDownloadResult | null> {
   for (const profile of NATIVE_INNERTUBE_CLIENTS) {
     if (signal.aborted) {
@@ -681,7 +477,7 @@ async function downloadViaNativeCapacitorIos(
     }
 
     try {
-      const response = await capacitorHttp.post({
+      const response = await CapacitorHttp.post({
         url: 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
         headers: {
           'Content-Type': 'application/json',
@@ -705,6 +501,7 @@ async function downloadViaNativeCapacitorIos(
       }
 
       if (response.status < 200 || response.status >= 300 || !response.data) {
+        errorsOut.push(`${profile.name}:HTTP${response.status}`);
         continue;
       }
 
@@ -715,56 +512,30 @@ async function downloadViaNativeCapacitorIos(
 
       const playability = payload?.playabilityStatus as Record<string, unknown> | undefined;
       if (playability?.status && playability.status !== 'OK') {
+        errorsOut.push(`${profile.name}:${String(playability.status)}`);
         continue;
       }
 
       const streamingData = payload?.streamingData as Record<string, unknown> | undefined;
       if (!streamingData) {
+        errorsOut.push(`${profile.name}:noStreamData`);
         continue;
       }
 
       const picked = pickInnertubeIosFormat(streamingData, mode, quality);
       if (!picked) {
+        errorsOut.push(`${profile.name}:noFormat`);
         continue;
       }
 
       onProgress({
         receivedBytes: 0,
         totalBytes: picked.contentLength,
-        progress: picked.contentLength ? 1 : 0,
+        progress: picked.contentLength ? 2 : 1,
         chunkIndex: 1,
       });
 
-      // Attempt streaming fetch first for fine-grained progress updates
-      try {
-        const mediaResp = await fetchImpl(picked.url, { signal });
-        if (mediaResp.ok) {
-          const ct = mediaResp.headers.get('content-type');
-          if (!ct || (!ct.includes('text/html') && !ct.includes('application/json'))) {
-            const { bytes } = await readResponseWithProgress(
-              mediaResp,
-              0,
-              picked.contentLength,
-              1,
-              onProgress
-            );
-            if (bytes.byteLength > 0) {
-              const blob = new Blob([bytes as BlobPart], { type: picked.mimeType });
-              return {
-                blob,
-                mimeType: picked.mimeType,
-                sizeBytes: blob.size,
-              };
-            }
-          }
-        }
-      } catch (err) {
-        if (signal.aborted || (err instanceof Error && err.name === 'AbortError')) {
-          throw err;
-        }
-        // Fall back to CapacitorHttp.get below if WKWebView blocked direct fetch
-      }
-
+      // Go straight through native CapacitorHttp.get (avoids WKWebView CORS / patched-fetch binary bugs)
       const capResult = await downloadBinaryWithCapacitorHttp(
         picked.url,
         picked.mimeType,
@@ -772,7 +543,7 @@ async function downloadViaNativeCapacitorIos(
         profile.userAgent,
         signal,
         onProgress,
-        capacitorHttp
+        errorsOut
       );
       if (capResult) {
         return capResult;
@@ -781,7 +552,7 @@ async function downloadViaNativeCapacitorIos(
       if (signal.aborted || (err instanceof Error && err.name === 'AbortError')) {
         throw err;
       }
-      // Try next InnerTube client profile automatically (VISIONOS -> ANDROID_VR -> IOS)
+      errorsOut.push(`${profile.name}:${err instanceof Error ? err.message : 'err'}`);
     }
 
     onProgress({
@@ -813,11 +584,11 @@ export async function downloadMediaInChunks(params: {
     signal,
     onProgress,
     fetchImpl = fetch,
-    loaderPollIntervalMs = 1200,
   } = params;
 
   const fallbackMime = mode === 'audio' ? 'audio/mp4' : 'video/mp4';
   let detectedMimeType: string = fallbackMime;
+  const nativeErrors: string[] = [];
 
   if (signal.aborted) {
     throw new DOMException('Download aborted', 'AbortError');
@@ -832,16 +603,24 @@ export async function downloadMediaInChunks(params: {
 
   const videoId = extractYouTubeVideoId(targetUrl);
   const targetIsYouTube = isYouTubeUrl(targetUrl);
-
-  const capacitor =
-    typeof window !== 'undefined'
-      ? (window as unknown as CapacitorWindow).Capacitor
-      : undefined;
-  const isNativeIos = Boolean(capacitor?.isNativePlatform?.());
-  const capacitorHttp = capacitor?.Plugins?.CapacitorHttp;
+  const isNative = Capacitor.isNativePlatform();
 
   // Step 0a: Direct non-YouTube URLs (live radio, direct MP3/MP4 files)
   if (!targetIsYouTube && /^https?:\/\//i.test(targetUrl)) {
+    if (isNative) {
+      const nativeDirectRes = await downloadBinaryWithCapacitorHttp(
+        targetUrl,
+        fallbackMime,
+        null,
+        undefined,
+        signal,
+        onProgress,
+        nativeErrors
+      );
+      if (nativeDirectRes) {
+        return nativeDirectRes;
+      }
+    }
     const directRes = await downloadFromDirectCandidate(
       targetUrl,
       signal,
@@ -852,33 +631,17 @@ export async function downloadMediaInChunks(params: {
     if (directRes) {
       return directRes;
     }
-
-    if (isNativeIos && capacitorHttp) {
-      const nativeDirectRes = await downloadBinaryWithCapacitorHttp(
-        targetUrl,
-        fallbackMime,
-        null,
-        undefined,
-        signal,
-        onProgress,
-        capacitorHttp
-      );
-      if (nativeDirectRes) {
-        return nativeDirectRes;
-      }
-    }
   }
 
   // Step 0b: Native Capacitor iOS direct YouTube downloader (VISIONOS -> ANDROID_VR -> IOS)
-  if (isNativeIos && capacitorHttp && videoId) {
+  if (isNative && videoId) {
     const nativeRes = await downloadViaNativeCapacitorIos(
       videoId,
       mode,
       quality,
       signal,
       onProgress,
-      fetchImpl,
-      capacitorHttp
+      nativeErrors
     );
     if (nativeRes) {
       return nativeRes;
@@ -899,6 +662,21 @@ export async function downloadMediaInChunks(params: {
   }
 
   if (resolved && directUrl && directUrl !== fallbackUrl) {
+    if (isNative) {
+      const nativeBackendDirectRes = await downloadBinaryWithCapacitorHttp(
+        directUrl,
+        fallbackMime,
+        null,
+        NATIVE_INNERTUBE_CLIENTS[0].userAgent,
+        signal,
+        onProgress,
+        nativeErrors
+      );
+      if (nativeBackendDirectRes) {
+        return nativeBackendDirectRes;
+      }
+    }
+
     const directRes = await downloadFromDirectCandidate(
       directUrl,
       signal,
@@ -908,21 +686,6 @@ export async function downloadMediaInChunks(params: {
     );
     if (directRes) {
       return directRes;
-    }
-
-    if (isNativeIos && capacitorHttp) {
-      const nativeBackendDirectRes = await downloadBinaryWithCapacitorHttp(
-        directUrl,
-        fallbackMime,
-        null,
-        NATIVE_INNERTUBE_CLIENTS[0].userAgent,
-        signal,
-        onProgress,
-        capacitorHttp
-      );
-      if (nativeBackendDirectRes) {
-        return nativeBackendDirectRes;
-      }
     }
   }
 
@@ -997,70 +760,15 @@ export async function downloadMediaInChunks(params: {
     };
   }
 
-  if (backendFailedStatus !== null && backendFailedStatus < 500) {
-    const unchunkedRes = await downloadFromDirectCandidate(
-      fallbackUrl,
-      signal,
-      onProgress,
-      fetchImpl,
-      fallbackMime
-    );
-    if (unchunkedRes) {
-      return unchunkedRes;
-    }
-  }
-
-  // Step 3: Client-side public Piped / Invidious CORS fallback
-  if (videoId) {
-    const publicUrls = await resolvePublicFallbackUrls(
-      videoId,
-      mode,
-      quality,
-      signal,
-      fetchImpl
-    );
-    for (const candidateUrl of publicUrls) {
-      if (signal.aborted) {
-        throw new DOMException('Download aborted', 'AbortError');
-      }
-      const res = await downloadFromDirectCandidate(
-        candidateUrl,
-        signal,
-        onProgress,
-        fetchImpl,
-        fallbackMime
-      );
-      if (res) {
-        return res;
-      }
-    }
-  }
-
-  // Step 4: Loader.to / Oceansaver fallback
-  if (targetIsYouTube || videoId) {
-    const loaderRes = await downloadViaLoaderFallback(
-      targetUrl,
-      mode,
-      quality,
-      signal,
-      onProgress,
-      fetchImpl,
-      fallbackMime,
-      loaderPollIntervalMs
-    );
-    if (loaderRes) {
-      return loaderRes;
-    }
-  }
-
-  if ((targetIsYouTube || videoId) && !isNativeIos) {
+  const diag = nativeErrors.length > 0 ? ` [${nativeErrors.slice(0, 3).join(', ')}]` : '';
+  if ((targetIsYouTube || videoId) && !isNative) {
     throw new Error('Web proxy blocked by YouTube — works natively in iPhone IPA');
   }
 
   throw new Error(
     backendFailedStatus
-      ? `Download failed (HTTP ${backendFailedStatus}) and fallbacks were unavailable.`
-      : 'Unable to download media stream.'
+      ? `Download failed (HTTP ${backendFailedStatus})${diag}`
+      : `Unable to download media stream${diag}`
   );
 }
 
