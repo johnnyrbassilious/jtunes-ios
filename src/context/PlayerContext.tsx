@@ -60,6 +60,11 @@ interface ResolvedStreamCacheEntry {
   url: string;
   mime: string;
   expiresAt: number;
+  /** Separate audio-only track, present when `url` carries no audio. */
+  audioUrl?: string;
+  audioMime?: string;
+  /** `url` is an HLS manifest; the native player muxes it for us. */
+  isHls?: boolean;
 }
 
 interface NetworkInformationLike {
@@ -68,7 +73,7 @@ interface NetworkInformationLike {
 }
 
 interface NativeInnertubeProfile {
-  name: 'VISIONOS' | 'ANDROID_VR' | 'IOS';
+  name: 'VISIONOS' | 'ANDROID_VR' | 'IOS' | 'TVHTML5' | 'WEB';
   userAgent: string;
   clientNameHeader: string;
   clientVersion: string;
@@ -128,12 +133,40 @@ const NATIVE_IOS_INNERTUBE_PROFILES: readonly NativeInnertubeProfile[] = [
       gl: 'US',
     },
   },
+  {
+    name: 'TVHTML5',
+    userAgent:
+      'Mozilla/5.0 (PlayStation; PlayStation 5/2.26) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0 Safari/605.1.15',
+    clientNameHeader: '85',
+    clientVersion: '2.0',
+    clientPayload: {
+      clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+      clientVersion: '2.0',
+      hl: 'en',
+      gl: 'US',
+    },
+  },
+  {
+    name: 'WEB',
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    clientNameHeader: '1',
+    clientVersion: '2.20241010.01.00',
+    clientPayload: {
+      clientName: 'WEB',
+      clientVersion: '2.20241010.01.00',
+      hl: 'en',
+      gl: 'US',
+    },
+  },
 ];
 
 const NATIVE_AUDIO_ASSET_ID = 'jtunes-active-track';
+const DUAL_AUDIO_ASSET_ID = 'jtunes-active-track-audio';
 const DEFAULT_STREAM_CACHE_TTL_MS = 15 * 60 * 1000;
 const STALL_RECOVERY_DELAY_MS = 5000;
 const ROLLING_AUTOPLAY_MIN_UPCOMING = 4;
+const DUAL_DRIFT_TOLERANCE_SEC = 0.35;
 
 function buildSilentKeepAliveWavDataUri(): string {
   const sampleRate = 8000;
@@ -289,17 +322,67 @@ function getEffectiveRequestMode(
   return isAudioOnly || slowNetwork || track.mode === 'audio' ? 'audio' : 'video';
 }
 
+type RawFormat = Record<string, unknown>;
+
+function formatMime(f: RawFormat): string {
+  return typeof f.mimeType === 'string' ? f.mimeType : '';
+}
+
+function formatUrl(f: RawFormat): string {
+  return typeof f.url === 'string' ? f.url : '';
+}
+
+function formatHeight(f: RawFormat): number {
+  return Number(f.height ?? 0) || 0;
+}
+
+function formatBitrate(f: RawFormat): number {
+  return Number(f.bitrate ?? f.averageBitrate ?? 0) || 0;
+}
+
+function cleanMime(f: RawFormat, fallback: string): string {
+  return formatMime(f).split(';')[0].trim() || fallback;
+}
+
+/** Best audio-only track, preferring AAC/m4a because AVPlayer handles it natively. */
+function pickAudioFormat(
+  adaptiveFormats: RawFormat[],
+  formats: RawFormat[],
+  preferLowestOverhead: boolean
+): { url: string; mime: string } | null {
+  const allAudio = [...adaptiveFormats, ...formats].filter((f) => {
+    return formatUrl(f).length > 0 && formatMime(f).startsWith('audio/');
+  });
+  if (allAudio.length === 0) {
+    return null;
+  }
+  const mp4Audio = allAudio.filter((f) =>
+    formatMime(f).toLowerCase().includes('audio/mp4')
+  );
+  const pool = mp4Audio.length > 0 ? mp4Audio : allAudio;
+  const sorted = [...pool].sort((a, b) =>
+    preferLowestOverhead ? formatBitrate(a) - formatBitrate(b) : formatBitrate(b) - formatBitrate(a)
+  );
+  const chosen = preferLowestOverhead
+    ? sorted.find((f) => formatBitrate(f) >= 48_000) ?? sorted[0]
+    : sorted[0];
+  return {
+    url: formatUrl(chosen),
+    mime: cleanMime(chosen, 'audio/mp4'),
+  };
+}
+
 function pickNativeIosStreamingFormat(
   streamingData: Record<string, unknown>,
   mode: MediaFormatMode,
   quality: string,
   preferLowestOverhead: boolean
-): { url: string; mime: string } | null {
+): Omit<ResolvedStreamCacheEntry, 'expiresAt'> | null {
   const formats = Array.isArray(streamingData.formats)
-    ? (streamingData.formats as Array<Record<string, unknown>>)
+    ? (streamingData.formats as RawFormat[])
     : [];
   const adaptiveFormats = Array.isArray(streamingData.adaptiveFormats)
-    ? (streamingData.adaptiveFormats as Array<Record<string, unknown>>)
+    ? (streamingData.adaptiveFormats as RawFormat[])
     : [];
   const hlsManifestUrl =
     typeof streamingData.hlsManifestUrl === 'string' && streamingData.hlsManifestUrl.length > 0
@@ -307,62 +390,67 @@ function pickNativeIosStreamingFormat(
       : null;
 
   if (mode === 'audio') {
-    const allAudio = [...adaptiveFormats, ...formats].filter((f) => {
-      const mime = typeof f.mimeType === 'string' ? f.mimeType : '';
-      return typeof f.url === 'string' && f.url.length > 0 && mime.startsWith('audio/');
-    });
-    const mp4Audio = allAudio.filter((f) =>
-      String(f.mimeType ?? '').toLowerCase().includes('audio/mp4')
-    );
-    const pool = mp4Audio.length > 0 ? mp4Audio : allAudio;
-    if (pool.length > 0) {
-      const sorted = [...pool].sort((a, b) => {
-        const rateA = Number(a.bitrate ?? a.averageBitrate ?? 0);
-        const rateB = Number(b.bitrate ?? b.averageBitrate ?? 0);
-        return preferLowestOverhead ? rateA - rateB : rateB - rateA;
-      });
-      const chosen =
-        preferLowestOverhead
-          ? sorted.find((f) => Number(f.bitrate ?? f.averageBitrate ?? 0) >= 48_000) ?? sorted[0]
-          : sorted[0];
-      const rawMime = typeof chosen.mimeType === 'string' ? chosen.mimeType : 'audio/mp4';
-      return {
-        url: String(chosen.url),
-        mime: rawMime.split(';')[0].trim() || 'audio/mp4',
-      };
+    const picked = pickAudioFormat(adaptiveFormats, formats, preferLowestOverhead);
+    if (picked) {
+      return picked;
     }
     if (hlsManifestUrl) {
-      return { url: hlsManifestUrl, mime: 'application/x-mpegURL' };
+      return { url: hlsManifestUrl, mime: 'application/x-mpegURL', isHls: true };
     }
     return null;
   }
 
   const desiredHeight = Number.parseInt(quality, 10) || 720;
-  const progressiveMp4 = formats.filter((f) => {
-    const mime = typeof f.mimeType === 'string' ? f.mimeType : '';
-    return typeof f.url === 'string' && f.url.length > 0 && mime.includes('video/mp4');
-  });
 
+  // 1. Progressive MP4 already contains picture and sound in one request.
+  const progressiveMp4 = formats.filter(
+    (f) => formatUrl(f).length > 0 && formatMime(f).includes('video/mp4')
+  );
   if (progressiveMp4.length > 0) {
     const sorted = [...progressiveMp4].sort(
-      (a, b) => Number(b.height ?? 0) - Number(a.height ?? 0)
+      (a, b) => formatHeight(b) - formatHeight(a)
     );
     const chosen =
-      sorted.find((f) => Number(f.height ?? 0) === desiredHeight) ??
+      sorted.find((f) => formatHeight(f) === desiredHeight) ??
       sorted.find((f) => {
-        const h = Number(f.height ?? 0);
+        const h = formatHeight(f);
         return h > 0 && h <= desiredHeight;
       }) ??
       sorted[sorted.length - 1];
-    const rawMime = typeof chosen.mimeType === 'string' ? chosen.mimeType : 'video/mp4';
     return {
-      url: String(chosen.url),
-      mime: rawMime.split(';')[0].trim() || 'video/mp4',
+      url: formatUrl(chosen),
+      mime: cleanMime(chosen, 'video/mp4'),
     };
   }
 
+  // 2. HLS: AVPlayer and WKWebView both mux this natively.
   if (hlsManifestUrl) {
-    return { url: hlsManifestUrl, mime: 'application/x-mpegURL' };
+    return { url: hlsManifestUrl, mime: 'application/x-mpegURL', isHls: true };
+  }
+
+  // 3. Adaptive video + separate audio, muxed client-side.
+  const adaptiveVideo = adaptiveFormats.filter(
+    (f) => formatUrl(f).length > 0 && formatMime(f).startsWith('video/mp4')
+  );
+  if (adaptiveVideo.length > 0) {
+    const capped = adaptiveVideo.filter((f) => {
+      const h = formatHeight(f);
+      return h > 0 && h <= desiredHeight;
+    });
+    const pool = [...(capped.length > 0 ? capped : adaptiveVideo)].sort(
+      (a, b) => formatHeight(b) - formatHeight(a) || formatBitrate(b) - formatBitrate(a)
+    );
+    const chosenVideo = pool[0];
+    const audio = pickAudioFormat(adaptiveFormats, formats, false);
+    const entry: Omit<ResolvedStreamCacheEntry, 'expiresAt'> = {
+      url: formatUrl(chosenVideo),
+      mime: cleanMime(chosenVideo, 'video/mp4'),
+    };
+    if (audio) {
+      entry.audioUrl = audio.url;
+      entry.audioMime = audio.mime;
+    }
+    return entry;
   }
 
   return null;
@@ -425,8 +513,7 @@ async function resolveNativeIosInnertubeStream(
       );
       if (picked) {
         return {
-          url: picked.url,
-          mime: picked.mime,
+          ...picked,
           expiresAt: computeStreamExpiry(picked.url),
         };
       }
@@ -542,6 +629,16 @@ export function PlayerProvider({
   const nativeAudioPollRef = useRef<number | null>(null);
   const handleEndedRef = useRef<() => Promise<void>>(async () => {});
 
+  // Split-stream (video + separate audio) state
+  const dualAudioActiveRef = useRef(false);
+  const dualVideoElRef = useRef<HTMLVideoElement | null>(null);
+  // Position to re-apply after a background hand-off rebuilds the player
+  const pendingSeekRef = useRef<number | null>(null);
+  const handoffRef = useRef<{ trackId: string; position: number } | null>(null);
+  const currentTrackRef = useRef<PlayableTrack | null>(null);
+  const currentTimeRef = useRef(0);
+  currentTimeRef.current = 0;
+
   const [queue, setQueue] = useState<PlayableTrack[]>([]);
   const [currentIndex, setCurrentIndex] = useState(-1);
   const [playNonce, setPlayNonce] = useState(0);
@@ -576,6 +673,8 @@ export function PlayerProvider({
     }
     return queue[currentIndex];
   }, [queue, currentIndex]);
+
+  currentTrackRef.current = currentTrack;
 
   const useAudioElementForTrack = useCallback((track: PlayableTrack | null): boolean => {
     if (!track) {
@@ -625,6 +724,7 @@ export function PlayerProvider({
         // Ignore cleanup errors
       }
     });
+    dualVideoElRef.current = null;
   }, []);
 
   const clearNativeAudioPoll = useCallback(() => {
@@ -638,18 +738,22 @@ export function PlayerProvider({
     clearNativeAudioPoll();
     const wasActive = isNativeAudioActiveRef.current;
     isNativeAudioActiveRef.current = false;
+    dualAudioActiveRef.current = false;
+    dualVideoElRef.current = null;
     if (!Capacitor.isNativePlatform() || !wasActive) {
       return;
     }
-    try {
-      await NativeAudio.stop({ assetId: NATIVE_AUDIO_ASSET_ID });
-    } catch {
-      // Ignore if already stopped
-    }
-    try {
-      await NativeAudio.unload({ assetId: NATIVE_AUDIO_ASSET_ID });
-    } catch {
-      // Ignore if already unloaded
+    for (const assetId of [NATIVE_AUDIO_ASSET_ID, DUAL_AUDIO_ASSET_ID]) {
+      try {
+        await NativeAudio.stop({ assetId });
+      } catch {
+        // Ignore if already stopped
+      }
+      try {
+        await NativeAudio.unload({ assetId });
+      } catch {
+        // Ignore if already unloaded
+      }
     }
   }, [clearNativeAudioPoll]);
 
@@ -662,14 +766,30 @@ export function PlayerProvider({
       if (!isNativeAudioActiveRef.current) {
         return;
       }
-      void NativeAudio.getCurrentTime({ assetId: NATIVE_AUDIO_ASSET_ID })
+      const assetId = dualAudioActiveRef.current ? DUAL_AUDIO_ASSET_ID : NATIVE_AUDIO_ASSET_ID;
+      void NativeAudio.getCurrentTime({ assetId })
         .then((res) => {
-          if (isNativeAudioActiveRef.current && Number.isFinite(res.currentTime)) {
-            setCurrentTime(res.currentTime);
+          if (!isNativeAudioActiveRef.current || !Number.isFinite(res.currentTime)) {
+            return;
+          }
+          const audioPosition = res.currentTime;
+          setCurrentTime(audioPosition);
+
+          // Keep the muted video frame glued to the audio track.
+          const video = dualVideoElRef.current;
+          if (dualAudioActiveRef.current && video && Number.isFinite(video.currentTime)) {
+            const drift = video.currentTime - audioPosition;
+            if (Math.abs(drift) > DUAL_DRIFT_TOLERANCE_SEC) {
+              try {
+                video.currentTime = audioPosition;
+              } catch {
+                // Seek raced with a buffering event
+              }
+            }
           }
         })
         .catch(() => {});
-      void NativeAudio.isPlaying({ assetId: NATIVE_AUDIO_ASSET_ID })
+      void NativeAudio.isPlaying({ assetId })
         .then((res) => {
           if (isNativeAudioActiveRef.current && typeof res.isPlaying === 'boolean') {
             setIsPlaying(res.isPlaying);
@@ -693,7 +813,9 @@ export function PlayerProvider({
 
     let listenerHandle: { remove: () => Promise<void> } | null = null;
     void NativeAudio.addListener('complete', (event: { assetId?: string }) => {
-      if (event?.assetId === NATIVE_AUDIO_ASSET_ID && isNativeAudioActiveRef.current) {
+      const isPrimary = event?.assetId === NATIVE_AUDIO_ASSET_ID;
+      const isDual = event?.assetId === DUAL_AUDIO_ASSET_ID;
+      if ((isPrimary || isDual) && isNativeAudioActiveRef.current) {
         void handleEndedRef.current();
       }
     })
@@ -961,6 +1083,20 @@ export function PlayerProvider({
     [defaultQuality]
   );
 
+  const applyPendingSeek = useCallback(async (assetId: string) => {
+    const pending = pendingSeekRef.current;
+    if (pending === null || !Number.isFinite(pending) || pending <= 0) {
+      return;
+    }
+    pendingSeekRef.current = null;
+    try {
+      await NativeAudio.setCurrentTime({ assetId, time: pending });
+      setCurrentTime(pending);
+    } catch {
+      // Ignore; playback simply starts from zero
+    }
+  }, []);
+
   const startHtmlMediaPlayback = useCallback(
     (mediaEl: HTMLMediaElement, src: string, rate: number) => {
       void stopNativeAudio();
@@ -986,6 +1122,87 @@ export function PlayerProvider({
     [stopBackgroundKeepAlive, stopInactiveMediaEl, stopNativeAudio]
   );
 
+  // Split stream: muted <video> for the picture, native AVPlayer for the sound.
+  // This is what lets 1080p and audio-less progressive formats play at all.
+  const startDualStreamPlayback = useCallback(
+    (
+      videoEl: HTMLVideoElement,
+      stream: ResolvedStreamCacheEntry,
+      rate: number,
+      track: PlayableTrack,
+      activeToken?: number
+    ) => {
+      if (!stream.audioUrl) {
+        startHtmlMediaPlayback(videoEl, stream.url, rate);
+        return;
+      }
+
+      stopInactiveMediaEl(videoEl);
+      stopBackgroundKeepAlive();
+      shouldKeepPlayingInBackgroundRef.current = true;
+      setIsBuffering(true);
+
+      videoEl.muted = true;
+      if (videoEl.src !== stream.url) {
+        videoEl.src = stream.url;
+      }
+      videoEl.playbackRate = rate;
+      videoEl.loop = false;
+      void videoEl.play().catch(() => {});
+      dualVideoElRef.current = videoEl;
+
+      void (async () => {
+        try {
+          await stopNativeAudio();
+          if (typeof activeToken === 'number' && loadNonceRef.current !== activeToken) {
+            return;
+          }
+
+          await NativeAudio.preload({
+            assetId: DUAL_AUDIO_ASSET_ID,
+            assetPath: stream.audioUrl as string,
+            isUrl: true,
+            notificationMetadata: {
+              title: track.title || 'Jtunes',
+              artist: track.uploader || 'Jtunes',
+              album: 'Jtunes',
+              artworkUrl: track.thumbnail || undefined,
+            },
+          } as any);
+
+          if (typeof activeToken === 'number' && loadNonceRef.current !== activeToken) {
+            await NativeAudio.unload({ assetId: DUAL_AUDIO_ASSET_ID }).catch(() => {});
+            return;
+          }
+
+          dualAudioActiveRef.current = true;
+          isNativeAudioActiveRef.current = true;
+          await NativeAudio.play({ assetId: DUAL_AUDIO_ASSET_ID });
+          await applyPendingSeek(DUAL_AUDIO_ASSET_ID);
+          setIsPlaying(true);
+          setIsBuffering(false);
+          setPlayerError(null);
+          startNativeAudioPoll();
+
+          void NativeAudio.getDuration({ assetId: DUAL_AUDIO_ASSET_ID })
+            .then((res) => {
+              if (isNativeAudioActiveRef.current && res.duration > 0) {
+                setDuration(res.duration);
+              }
+            })
+            .catch(() => {});
+        } catch {
+          // Audio leg failed: unmute the video so the clip is at least audible.
+          dualAudioActiveRef.current = false;
+          isNativeAudioActiveRef.current = false;
+          videoEl.muted = false;
+          setIsBuffering(false);
+        }
+      })();
+    },
+    [applyPendingSeek, startHtmlMediaPlayback, startNativeAudioPoll, stopBackgroundKeepAlive, stopInactiveMediaEl, stopNativeAudio]
+  );
+
   // Route remote Audio Mode / Live Radio streams through native iOS AVPlayer (@capgo/capacitor-native-audio)
   // so playback continues uninterrupted on Lock Screen and outside WKWebView.
   const startNativeMediaPlayback = useCallback(
@@ -994,17 +1211,30 @@ export function PlayerProvider({
       src: string,
       rate: number,
       track?: PlayableTrack | null,
-      activeToken?: number
+      activeToken?: number,
+      stream?: ResolvedStreamCacheEntry | null
     ) => {
       const targetTrack = track ?? currentTrack;
+
+      if (stream?.audioUrl && targetTrack && !useAudioElementForTrack(targetTrack)) {
+        startDualStreamPlayback(mediaEl as HTMLVideoElement, stream, rate, targetTrack, activeToken);
+        return;
+      }
+
+      const effectiveSrc =
+        stream?.audioUrl && useAudioElementForTrack(targetTrack ?? null)
+          ? stream.audioUrl
+          : src;
+
       const shouldUseNativeAvPlayer =
         Capacitor.isNativePlatform() &&
         Boolean(targetTrack) &&
         useAudioElementForTrack(targetTrack) &&
-        /^https?:\/\//i.test(src);
+        /^https?:\/\//i.test(effectiveSrc) &&
+        !stream?.isHls;
 
       if (!shouldUseNativeAvPlayer || !targetTrack) {
-        startHtmlMediaPlayback(mediaEl, src, rate);
+        startHtmlMediaPlayback(mediaEl, effectiveSrc, rate);
         return;
       }
 
@@ -1022,7 +1252,7 @@ export function PlayerProvider({
 
           await NativeAudio.preload({
             assetId: NATIVE_AUDIO_ASSET_ID,
-            assetPath: src,
+            assetPath: effectiveSrc,
             isUrl: true,
             notificationMetadata: {
               title: targetTrack.title || 'Jtunes',
@@ -1039,6 +1269,7 @@ export function PlayerProvider({
 
           isNativeAudioActiveRef.current = true;
           await NativeAudio.play({ assetId: NATIVE_AUDIO_ASSET_ID });
+          await applyPendingSeek(NATIVE_AUDIO_ASSET_ID);
           setIsPlaying(true);
           setIsBuffering(false);
           setPlayerError(null);
@@ -1061,12 +1292,14 @@ export function PlayerProvider({
           }
           // Graceful fallback to HTML <audio> if native AVPlayer rejects a specific stream URL
           isNativeAudioActiveRef.current = false;
-          startHtmlMediaPlayback(mediaEl, src, rate);
+          startHtmlMediaPlayback(mediaEl, effectiveSrc, rate);
         }
       })();
     },
     [
+      applyPendingSeek,
       currentTrack,
+      startDualStreamPlayback,
       startHtmlMediaPlayback,
       startNativeAudioPoll,
       stopAllHtmlMediaEls,
@@ -1198,7 +1431,14 @@ export function PlayerProvider({
     if (cachedHit) {
       activeStreamCacheKeyRef.current = cachedHit.cacheKey;
       setYoutubeFallbackId(null);
-      startNativeMediaPlayback(mediaEl, cachedHit.entry.url, playbackRate, currentTrack, activeToken);
+      startNativeMediaPlayback(
+        mediaEl,
+        cachedHit.entry.url,
+        playbackRate,
+        currentTrack,
+        activeToken,
+        cachedHit.entry
+      );
       return;
     }
 
@@ -1220,7 +1460,18 @@ export function PlayerProvider({
       if (resolved.entry) {
         activeStreamCacheKeyRef.current = resolved.cacheKey;
         setYoutubeFallbackId(null);
-        setOverrideStreamUrl(resolved.entry.url);
+        startNativeMediaPlayback(
+          mediaEl,
+          resolved.entry.url,
+          playbackRate,
+          currentTrack,
+          activeToken,
+          resolved.entry
+        );
+        return;
+      }
+      if (resolved.fallbackUrl) {
+        setOverrideStreamUrl(resolved.fallbackUrl);
         return;
       }
       if (ytId) {
@@ -1229,13 +1480,9 @@ export function PlayerProvider({
         setYoutubeFallbackId(ytId);
         return;
       }
-      if (resolved.fallbackUrl) {
-        setOverrideStreamUrl(resolved.fallbackUrl);
-      } else {
-        stopBackgroundKeepAlive();
-        setIsBuffering(false);
-        setPlayerError('Could not load this stream.');
-      }
+      stopBackgroundKeepAlive();
+      setIsBuffering(false);
+      setPlayerError('Could not load this stream.');
     });
 
     return () => {
@@ -1477,6 +1724,9 @@ export function PlayerProvider({
     if (audioRef.current) {
       audioRef.current.playbackRate = playbackRate;
     }
+    if (dualVideoElRef.current) {
+      dualVideoElRef.current.playbackRate = playbackRate;
+    }
     youtubeBridgeRef.current?.setPlaybackRate(playbackRate);
   }, [playbackRate]);
 
@@ -1499,7 +1749,9 @@ export function PlayerProvider({
   const pauseActivePlayback = useCallback(() => {
     shouldKeepPlayingInBackgroundRef.current = false;
     if (isNativeAudioActiveRef.current) {
-      void NativeAudio.pause({ assetId: NATIVE_AUDIO_ASSET_ID }).catch(() => {});
+      const assetId = dualAudioActiveRef.current ? DUAL_AUDIO_ASSET_ID : NATIVE_AUDIO_ASSET_ID;
+      void NativeAudio.pause({ assetId }).catch(() => {});
+      dualVideoElRef.current?.pause();
     } else if (youtubeFallbackId) {
       youtubeBridgeRef.current?.pause();
     } else {
@@ -1549,6 +1801,8 @@ export function PlayerProvider({
     triedFallbackStageRef.current = 0;
     embedRecoveryInFlightRef.current = false;
     activeStreamCacheKeyRef.current = null;
+    pendingSeekRef.current = null;
+    handoffRef.current = null;
     setOverrideStreamUrl(null);
     setYoutubeFallbackId(null);
     setPlayerError(null);
@@ -1833,14 +2087,17 @@ export function PlayerProvider({
     }
 
     if (isNativeAudioActiveRef.current) {
+      const assetId = dualAudioActiveRef.current ? DUAL_AUDIO_ASSET_ID : NATIVE_AUDIO_ASSET_ID;
       try {
         if (isPlaying) {
           shouldKeepPlayingInBackgroundRef.current = false;
-          await NativeAudio.pause({ assetId: NATIVE_AUDIO_ASSET_ID });
+          await NativeAudio.pause({ assetId });
+          dualVideoElRef.current?.pause();
           setIsPlaying(false);
         } else {
           shouldKeepPlayingInBackgroundRef.current = true;
-          await NativeAudio.resume({ assetId: NATIVE_AUDIO_ASSET_ID });
+          await NativeAudio.resume({ assetId });
+          void dualVideoElRef.current?.play().catch(() => {});
           setIsPlaying(true);
         }
       } catch (err) {
@@ -1888,10 +2145,19 @@ export function PlayerProvider({
     (seconds: number) => {
       if (isNativeAudioActiveRef.current) {
         const clamped = clampSeekTime(seconds, duration);
+        const assetId = dualAudioActiveRef.current ? DUAL_AUDIO_ASSET_ID : NATIVE_AUDIO_ASSET_ID;
         void NativeAudio.setCurrentTime({
-          assetId: NATIVE_AUDIO_ASSET_ID,
+          assetId,
           time: clamped,
         }).catch(() => {});
+        const video = dualVideoElRef.current;
+        if (video) {
+          try {
+            video.currentTime = clamped;
+          } catch {
+            // Ignore transient seek errors
+          }
+        }
         setCurrentTime(clamped);
         return;
       }
@@ -2009,7 +2275,10 @@ export function PlayerProvider({
         if (firstManualIdx === activeIdx) {
           seekTo(0);
           if (isNativeAudioActiveRef.current) {
-            void NativeAudio.resume({ assetId: NATIVE_AUDIO_ASSET_ID }).catch(() => {});
+            const assetId = dualAudioActiveRef.current
+              ? DUAL_AUDIO_ASSET_ID
+              : NATIVE_AUDIO_ASSET_ID;
+            void NativeAudio.resume({ assetId }).catch(() => {});
           } else if (youtubeFallbackId) {
             youtubeBridgeRef.current?.play();
           } else {
@@ -2033,7 +2302,8 @@ export function PlayerProvider({
       if (nextIdx === activeIdx) {
         seekTo(0);
         if (isNativeAudioActiveRef.current) {
-          void NativeAudio.resume({ assetId: NATIVE_AUDIO_ASSET_ID }).catch(() => {});
+          const assetId = dualAudioActiveRef.current ? DUAL_AUDIO_ASSET_ID : NATIVE_AUDIO_ASSET_ID;
+          void NativeAudio.resume({ assetId }).catch(() => {});
         } else if (youtubeFallbackId) {
           youtubeBridgeRef.current?.play();
         } else {
@@ -2094,7 +2364,8 @@ export function PlayerProvider({
     if (action.action === 'restart') {
       seekTo(0);
       if (isNativeAudioActiveRef.current) {
-        void NativeAudio.resume({ assetId: NATIVE_AUDIO_ASSET_ID }).catch(() => {});
+        const assetId = dualAudioActiveRef.current ? DUAL_AUDIO_ASSET_ID : NATIVE_AUDIO_ASSET_ID;
+        void NativeAudio.resume({ assetId }).catch(() => {});
       } else if (youtubeFallbackId) {
         youtubeBridgeRef.current?.play();
       } else if (mediaEl && mediaEl.paused) {
@@ -2130,6 +2401,9 @@ export function PlayerProvider({
     }
     if (audioRef.current) {
       audioRef.current.playbackRate = rate;
+    }
+    if (dualVideoElRef.current) {
+      dualVideoElRef.current.playbackRate = rate;
     }
     youtubeBridgeRef.current?.setPlaybackRate(rate);
   }, []);
@@ -2258,7 +2532,9 @@ export function PlayerProvider({
     setSafeHandler('play', () => {
       shouldKeepPlayingInBackgroundRef.current = true;
       if (isNativeAudioActiveRef.current) {
-        void NativeAudio.resume({ assetId: NATIVE_AUDIO_ASSET_ID }).catch(() => {});
+        const assetId = dualAudioActiveRef.current ? DUAL_AUDIO_ASSET_ID : NATIVE_AUDIO_ASSET_ID;
+        void NativeAudio.resume({ assetId }).catch(() => {});
+        void dualVideoElRef.current?.play().catch(() => {});
         setIsPlaying(true);
       } else if (youtubeFallbackId) {
         youtubeBridgeRef.current?.play();
@@ -2269,7 +2545,9 @@ export function PlayerProvider({
     setSafeHandler('pause', () => {
       shouldKeepPlayingInBackgroundRef.current = false;
       if (isNativeAudioActiveRef.current) {
-        void NativeAudio.pause({ assetId: NATIVE_AUDIO_ASSET_ID }).catch(() => {});
+        const assetId = dualAudioActiveRef.current ? DUAL_AUDIO_ASSET_ID : NATIVE_AUDIO_ASSET_ID;
+        void NativeAudio.pause({ assetId }).catch(() => {});
+        dualVideoElRef.current?.pause();
         setIsPlaying(false);
       } else if (youtubeFallbackId) {
         youtubeBridgeRef.current?.pause();
@@ -2338,6 +2616,76 @@ export function PlayerProvider({
     }
   }, [currentTrack, duration, currentTime, playbackRate]);
 
+  // Hand a playing video's audio to AVPlayer so it survives the app going to the background.
+  const handoffToAudioOnlyForBackground = useCallback(async () => {
+    const track = currentTrackRef.current;
+    if (!track || track.isLiveRadio || track.isOffline || audioOnlyModeRef.current) {
+      return;
+    }
+    if (isNativeAudioActiveRef.current && !dualAudioActiveRef.current) {
+      return;
+    }
+    const ytId = extractYouTubeVideoId(track.sourceUrl || track.url || '', track.id);
+    if (!ytId) {
+      return;
+    }
+    const video = videoRef.current;
+    const position =
+      video && Number.isFinite(video.currentTime) && video.currentTime > 0
+        ? video.currentTime
+        : currentTimeRef.current;
+
+    const resolved = await resolveTrackStreamForPlayback(
+      track.sourceUrl || track.url || '',
+      track.id,
+      'audio',
+      defaultQuality,
+      undefined,
+      8000
+    ).catch(() => null);
+
+    const audioUrl = resolved?.entry?.audioUrl ?? resolved?.entry?.url;
+    if (!audioUrl) {
+      return;
+    }
+
+    handoffRef.current = { trackId: track.id, position };
+    pendingSeekRef.current = position;
+    stopAllHtmlMediaEls();
+    stopBackgroundKeepAlive();
+    shouldKeepPlayingInBackgroundRef.current = true;
+
+    try {
+      await stopNativeAudio();
+      await NativeAudio.preload({
+        assetId: NATIVE_AUDIO_ASSET_ID,
+        assetPath: audioUrl,
+        isUrl: true,
+        notificationMetadata: {
+          title: track.title || 'Jtunes',
+          artist: track.uploader || 'Jtunes',
+          album: 'Jtunes',
+          artworkUrl: track.thumbnail || undefined,
+        },
+      } as any);
+      isNativeAudioActiveRef.current = true;
+      await NativeAudio.play({ assetId: NATIVE_AUDIO_ASSET_ID });
+      await applyPendingSeek(NATIVE_AUDIO_ASSET_ID);
+      setIsPlaying(true);
+      startNativeAudioPoll();
+    } catch {
+      isNativeAudioActiveRef.current = false;
+    }
+  }, [
+    applyPendingSeek,
+    defaultQuality,
+    resolveTrackStreamForPlayback,
+    startNativeAudioPoll,
+    stopAllHtmlMediaEls,
+    stopBackgroundKeepAlive,
+    stopNativeAudio,
+  ]);
+
   // Keep background playback alive when screen locks or app enters background
   useEffect(() => {
     if (typeof document === 'undefined') {
@@ -2346,6 +2694,12 @@ export function PlayerProvider({
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'hidden') {
         backgroundHiddenAtRef.current = Date.now();
+
+        // Video mode: move the sound to AVPlayer before WKWebView suspends.
+        if (!audioOnlyModeRef.current && shouldKeepPlayingInBackgroundRef.current) {
+          void handoffToAudioOnlyForBackground();
+        }
+
         if (!isNativeAudioActiveRef.current) {
           const mediaEl = getActiveMediaEl();
           if (
@@ -2360,6 +2714,17 @@ export function PlayerProvider({
                 void mediaEl.play().catch(() => {});
               }
             }, 200);
+          }
+        }
+      } else {
+        // Back in the foreground: rebuild the video at the same position.
+        const handoff = handoffRef.current;
+        if (handoff && currentTrackRef.current?.id === handoff.trackId) {
+          handoffRef.current = null;
+          if (!audioOnlyModeRef.current) {
+            pendingSeekRef.current = handoff.position;
+            setOverrideStreamUrl(null);
+            setPlayNonce((n) => n + 1);
           }
         }
       }
@@ -2401,7 +2766,16 @@ export function PlayerProvider({
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [currentTrack, getActiveMediaEl, isPlaying, duration, currentTime, playbackRate, youtubeFallbackId]);
+  }, [
+    currentTrack,
+    getActiveMediaEl,
+    handoffToAudioOnlyForBackground,
+    isPlaying,
+    duration,
+    currentTime,
+    playbackRate,
+    youtubeFallbackId,
+  ]);
 
   const scheduleStallRecovery = useCallback(() => {
     if (stallRecoveryTimerRef.current !== null || youtubeFallbackId || isNativeAudioActiveRef.current) {
@@ -2499,6 +2873,15 @@ export function PlayerProvider({
     mediaEl.loop = false;
     if (Number.isFinite(mediaEl.duration) && mediaEl.duration > 0) {
       setDuration(mediaEl.duration);
+    }
+    const pending = pendingSeekRef.current;
+    if (pending !== null && Number.isFinite(pending) && pending > 0) {
+      pendingSeekRef.current = null;
+      try {
+        mediaEl.currentTime = pending;
+      } catch {
+        // Ignore transient seek errors
+      }
     }
     setIsBuffering(false);
   };
@@ -2600,7 +2983,16 @@ export function PlayerProvider({
 
     if (loopMode === 'one') {
       if (isNativeAudioActiveRef.current) {
-        void NativeAudio.play({ assetId: NATIVE_AUDIO_ASSET_ID, time: 0 }).catch(() => {});
+        const assetId = dualAudioActiveRef.current ? DUAL_AUDIO_ASSET_ID : NATIVE_AUDIO_ASSET_ID;
+        void NativeAudio.play({ assetId, time: 0 }).catch(() => {});
+        const video = dualVideoElRef.current;
+        if (video) {
+          try {
+            video.currentTime = 0;
+          } catch {
+            // Ignore transient seek errors
+          }
+        }
       } else if (youtubeFallbackId) {
         youtubeBridgeRef.current?.seekTo(0);
         youtubeBridgeRef.current?.play();
@@ -2631,7 +3023,10 @@ export function PlayerProvider({
       if (firstManualIdx !== -1 && activeIdx === lastManualIdx) {
         if (firstManualIdx === activeIdx) {
           if (isNativeAudioActiveRef.current) {
-            void NativeAudio.play({ assetId: NATIVE_AUDIO_ASSET_ID, time: 0 }).catch(() => {});
+            const assetId = dualAudioActiveRef.current
+              ? DUAL_AUDIO_ASSET_ID
+              : NATIVE_AUDIO_ASSET_ID;
+            void NativeAudio.play({ assetId, time: 0 }).catch(() => {});
           } else if (youtubeFallbackId) {
             youtubeBridgeRef.current?.seekTo(0);
             youtubeBridgeRef.current?.play();
@@ -2665,7 +3060,8 @@ export function PlayerProvider({
     if (nextIdx !== -1) {
       if (nextIdx === activeIdx) {
         if (isNativeAudioActiveRef.current) {
-          void NativeAudio.play({ assetId: NATIVE_AUDIO_ASSET_ID, time: 0 }).catch(() => {});
+          const assetId = dualAudioActiveRef.current ? DUAL_AUDIO_ASSET_ID : NATIVE_AUDIO_ASSET_ID;
+          void NativeAudio.play({ assetId, time: 0 }).catch(() => {});
         } else if (youtubeFallbackId) {
           youtubeBridgeRef.current?.seekTo(0);
           youtubeBridgeRef.current?.play();
@@ -2756,6 +3152,27 @@ export function PlayerProvider({
     if (!currentTrack) {
       return;
     }
+
+    // Stage 1: drop the cached URL and rebuild once before surrendering to the iframe.
+    if (triedFallbackStageRef.current < 1) {
+      triedFallbackStageRef.current = 1;
+      setPlayerError(null);
+      setIsBuffering(true);
+      setOverrideStreamUrl(null);
+      setPlayNonce((n) => n + 1);
+      return;
+    }
+
+    const currentSrc = overrideStreamUrl || currentTrack.streamUrl;
+    if (
+      currentTrack.fallbackStreamUrl &&
+      currentTrack.fallbackStreamUrl !== currentSrc
+    ) {
+      setOverrideStreamUrl(currentTrack.fallbackStreamUrl);
+      return;
+    }
+
+    // Stage 2: last resort, the YouTube embed.
     const targetUrl = currentTrack.sourceUrl || currentTrack.url || '';
     const ytId = extractYouTubeVideoId(targetUrl, currentTrack.id);
     if (triedFallbackStageRef.current < 2 && ytId) {
@@ -2763,17 +3180,6 @@ export function PlayerProvider({
       setPlayerError(null);
       setIsBuffering(true);
       setYoutubeFallbackId(ytId);
-      return;
-    }
-
-    const currentSrc = overrideStreamUrl || currentTrack.streamUrl;
-    if (
-      triedFallbackStageRef.current < 1 &&
-      currentTrack.fallbackStreamUrl &&
-      currentTrack.fallbackStreamUrl !== currentSrc
-    ) {
-      triedFallbackStageRef.current = 1;
-      setOverrideStreamUrl(currentTrack.fallbackStreamUrl);
       return;
     }
 
