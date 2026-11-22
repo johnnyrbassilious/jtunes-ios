@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Capacitor } from '@capacitor/core';
+import { Directory, Filesystem } from '@capacitor/filesystem';
 import { BottomTabBar } from './components/BottomTabBar';
 import { DownloadsView } from './components/DownloadsView';
 import { FullScreenPlayer } from './components/FullScreenPlayer';
@@ -73,6 +75,19 @@ import {
 } from './utils/theme';
 
 const TAB_ORDER: readonly TabId[] = ['search', 'downloads', 'library', 'settings'] as const;
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const result = String(reader.result ?? '');
+      const comma = result.indexOf(',');
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
 
 interface TubidyAppShellProps {
   backendUrl: string;
@@ -352,6 +367,25 @@ function TubidyAppShell({
 
         await saveMediaToDB(record);
         setLibraryFiles((prev) => [record, ...prev]);
+
+        // Mirror the finished file onto the device so it lands in the Files app.
+        try {
+          if (Capacitor.isNativePlatform()) {
+            const baseName = sanitizeFilename(
+              `${downloadEntry.item.uploader} - ${downloadEntry.item.title}`,
+              'track'
+            );
+            const ext = downloadEntry.mode === 'audio' ? 'mp3' : 'mp4';
+            await Filesystem.writeFile({
+              path: `Jtunes/${baseName}.${ext}`,
+              data: await blobToBase64(finalBlob),
+              directory: Directory.Documents,
+              recursive: true,
+            });
+          }
+        } catch {
+          // Keep the IndexedDB copy if the filesystem write fails.
+        }
 
         if (attachToPlaylistId) {
           setPlaylists((prev) =>
