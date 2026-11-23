@@ -3,7 +3,7 @@ import { detectPlatform, normalizeBackendUrl } from './formatters';
 
 export const DEFAULT_BACKEND_URL = 'https://tubidy-vercel-api.vercel.app';
 export const BACKEND_URL_STORAGE_KEY = 'tubidy_backend_url';
-export const RESOLVE_STREAM_TIMEOUT_MS = 1500;
+export const RESOLVE_STREAM_TIMEOUT_MS = 8000;
 
 export function getSavedBackendUrl(): string {
   if (typeof window === 'undefined' || !window.localStorage) {

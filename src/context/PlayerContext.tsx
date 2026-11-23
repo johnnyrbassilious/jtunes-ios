@@ -540,6 +540,9 @@ export function PlayerProvider({
   const triedFallbackStageRef = useRef(0);
   const activeObjectUrlRef = useRef<string | null>(null);
   const synchronousPreloadedRef = useRef<{ trackId: string; src: string } | null>(null);
+  // Track which trackId the current overrideStreamUrl belongs to, so stale overrides
+  // from a previous track are never applied to the newly-loaded track.
+  const overrideStreamTrackIdRef = useRef<string | null>(null);
   const playedTrackIdsRef = useRef(new Set() as any);
   const fetchingRelatedRef = useRef(false);
   const rollingAutoplayInFlightRef = useRef(false);
@@ -572,10 +575,10 @@ export function PlayerProvider({
   const audioOnlyModeRef = useRef(audioOnlyMode);
   audioOnlyModeRef.current = audioOnlyMode;
 
-  const [isExpanded, setExpanded] = useState(false);
-  const [isQueueOpen, setQueueOpen] = useState(false);
-  const [isVideoFullscreen, setVideoFullscreen] = useState(false);
-  const [isLyricsViewOpen, setLyricsViewOpen] = useState(false);
+  const [isExpanded, setExpandedState] = useState(false);
+  const [isQueueOpen, setQueueOpenState] = useState(false);
+  const [isVideoFullscreen, setVideoFullscreenState] = useState(false);
+  const [isLyricsViewOpen, setLyricsViewOpenState] = useState(false);
   const [isPipActive, setIsPipActive] = useState(false);
   const [playerError, setPlayerError] = useState<string | null>(null);
   const [pipMessage, setPipMessage] = useState<string | null>(null);
@@ -845,10 +848,10 @@ export function PlayerProvider({
 
   useEffect(() => {
     if (!isExpanded || audioOnlyMode || !currentTrack) {
-      setVideoFullscreen(false);
+      setVideoFullscreenState(false);
     }
     if (!isExpanded) {
-      setQueueOpen(false);
+      setQueueOpenState(false);
     }
   }, [isExpanded, audioOnlyMode, currentTrack]);
 
@@ -858,7 +861,7 @@ export function PlayerProvider({
     }
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        setVideoFullscreen(false);
+        setVideoFullscreenState(false);
       }
     };
     window.addEventListener('keydown', onKeyDown);
@@ -1093,6 +1096,14 @@ export function PlayerProvider({
     ]
   );
 
+  // Clear the override stream URL whenever the active track changes so a stale
+  // URL from the previous track is never sent to the new track's playback effect.
+  useEffect(() => {
+    setOverrideStreamUrl(null);
+    overrideStreamTrackIdRef.current = null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentTrack?.id, playNonce]);
+
   // Instant playback loader + Native AVPlayer / HTML <audio> / <video> routing
   useEffect(() => {
     const mediaEl = getActiveMediaEl(currentTrack);
@@ -1139,8 +1150,15 @@ export function PlayerProvider({
       return;
     }
 
+    // Guard: if overrideStreamUrl was set for a different track, ignore it and
+    // let the resolution path below fetch a fresh URL for the current track.
+    const isOverrideForCurrentTrack =
+      overrideStreamUrl !== null &&
+      overrideStreamTrackIdRef.current === currentTrack.id;
+    const effectiveOverrideUrl = isOverrideForCurrentTrack ? overrideStreamUrl : null;
+
     const preloaded = synchronousPreloadedRef.current;
-    if (preloaded && preloaded.trackId === currentTrack.id && !overrideStreamUrl) {
+    if (preloaded && preloaded.trackId === currentTrack.id && !effectiveOverrideUrl) {
       synchronousPreloadedRef.current = null;
       setPlayerError(null);
       setPipMessage(null);
@@ -1162,7 +1180,7 @@ export function PlayerProvider({
 
     // 1. Offline Blob playback
     const offlineBlob = currentTrack.offlineBlob ?? currentTrack.blob;
-    if (!overrideStreamUrl && (currentTrack.isOffline || offlineBlob) && offlineBlob) {
+    if (!effectiveOverrideUrl && (currentTrack.isOffline || offlineBlob) && offlineBlob) {
       revokeActiveObjectUrl();
       const freshUrl = URL.createObjectURL(offlineBlob);
       activeObjectUrlRef.current = freshUrl;
@@ -1175,7 +1193,7 @@ export function PlayerProvider({
     }
 
     // 2. Live radio or explicit directStreamUrl
-    if (!overrideStreamUrl && (currentTrack.directStreamUrl || currentTrack.isLiveRadio)) {
+    if (!effectiveOverrideUrl && (currentTrack.directStreamUrl || currentTrack.isLiveRadio)) {
       const radioUrl =
         currentTrack.directStreamUrl ||
         currentTrack.streamUrl ||
@@ -1189,7 +1207,7 @@ export function PlayerProvider({
     }
 
     // 3. Explicit override or already-resolved stream URL
-    const preResolvedSrc = overrideStreamUrl || currentTrack.streamUrl;
+    const preResolvedSrc = effectiveOverrideUrl || currentTrack.streamUrl;
     if (preResolvedSrc) {
       startNativeMediaPlayback(mediaEl, preResolvedSrc, playbackRate, currentTrack, activeToken);
       return;
@@ -1222,6 +1240,8 @@ export function PlayerProvider({
     const trackKey = ytId || targetUrl;
     const cacheKey = buildStreamCacheKey(trackKey, requestMode, defaultQuality);
     activeStreamCacheKeyRef.current = cacheKey;
+    // Capture the track ID so we can validate the override when the effect re-runs
+    const resolveForTrackId = currentTrack.id;
     const controller = new AbortController();
     void resolveTrackStreamForPlayback(
       targetUrl,
@@ -1237,6 +1257,8 @@ export function PlayerProvider({
       if (resolved.entry) {
         activeStreamCacheKeyRef.current = resolved.cacheKey;
         setYoutubeFallbackId(null);
+        // Tag this override with the track it belongs to before committing
+        overrideStreamTrackIdRef.current = resolveForTrackId;
         setOverrideStreamUrl(resolved.entry.url);
         return;
       }
@@ -1247,6 +1269,7 @@ export function PlayerProvider({
         return;
       }
       if (resolved.fallbackUrl) {
+        overrideStreamTrackIdRef.current = resolveForTrackId;
         setOverrideStreamUrl(resolved.fallbackUrl);
       } else {
         stopBackgroundKeepAlive();
@@ -1431,6 +1454,42 @@ export function PlayerProvider({
   }, []);
 
   const togglePlayPause = useCallback(async () => {
+    // 1. If the YouTube iframe bridge is active, delegate to it.
+    if (youtubeBridgeRef.current && youtubeFallbackId) {
+      if (isPlaying) {
+        youtubeBridgeRef.current.pause();
+        setIsPlaying(false);
+      } else {
+        youtubeBridgeRef.current.play();
+        setIsPlaying(true);
+      }
+      return;
+    }
+
+    // 2. If the native AVPlayer is active, use NativeAudio APIs.
+    if (isNativeAudioActiveRef.current && Capacitor.isNativePlatform()) {
+      try {
+        if (isPlaying) {
+          await NativeAudio.pause({ assetId: NATIVE_AUDIO_ASSET_ID });
+          setIsPlaying(false);
+        } else {
+          await NativeAudio.resume({ assetId: NATIVE_AUDIO_ASSET_ID });
+          setIsPlaying(true);
+        }
+      } catch {
+        // If native audio APIs fail, fall through to HTML element
+        const mediaEl = getActiveMediaEl();
+        if (!mediaEl) return;
+        if (mediaEl.paused) {
+          try { await mediaEl.play(); setIsPlaying(true); } catch { setIsBuffering(false); }
+        } else {
+          mediaEl.pause(); setIsPlaying(false);
+        }
+      }
+      return;
+    }
+
+    // 3. Standard HTML <audio> / <video> element.
     const mediaEl = getActiveMediaEl();
     if (!mediaEl) return;
     if (mediaEl.paused) {
@@ -1444,7 +1503,7 @@ export function PlayerProvider({
       mediaEl.pause();
       setIsPlaying(false);
     }
-  }, [getActiveMediaEl]);
+  }, [getActiveMediaEl, isPlaying, youtubeFallbackId]);
 
   const seekTo = useCallback(
     (seconds: number) => {
@@ -1509,9 +1568,8 @@ export function PlayerProvider({
   }, []);
 
   const toggleAutoplayRelated = useCallback(() => {
-    setExpanded((prev) => {
+    setExpandedState((prev) => {
       const newVal = !prev;
-      setExpanded(newVal);
       onToggleAutoplayRelated?.();
       return newVal;
     });
@@ -1534,22 +1592,22 @@ export function PlayerProvider({
   }, [getActiveMediaEl]);
 
   const setExpanded = useCallback((expanded: boolean) => {
-    setExpanded(expanded);
+    setExpandedState(expanded);
     if (!expanded) {
-      setLyricsViewOpen(false);
+      setLyricsViewOpenState(false);
     }
   }, []);
 
   const setQueueOpen = useCallback((open: boolean) => {
-    setQueueOpen(open);
+    setQueueOpenState(open);
   }, []);
 
   const setVideoFullscreen = useCallback((fullscreen: boolean) => {
-    setVideoFullscreen(fullscreen);
+    setVideoFullscreenState(fullscreen);
   }, []);
 
   const setLyricsViewOpen = useCallback((open: boolean) => {
-    setLyricsViewOpen(open);
+    setLyricsViewOpenState(open);
   }, []);
 
   const stopAndClearCurrent = useCallback(() => {
@@ -1735,3 +1793,6 @@ export function usePlayerContext() {
   }
   return ctx;
 }
+
+// Alias for components that import `usePlayer` directly.
+export const usePlayer = usePlayerContext;
