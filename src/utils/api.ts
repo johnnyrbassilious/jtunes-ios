@@ -5,6 +5,8 @@ export const DEFAULT_BACKEND_URL = 'https://tubidy-vercel-api.vercel.app';
 export const BACKEND_URL_STORAGE_KEY = 'tubidy_backend_url';
 export const RESOLVE_STREAM_TIMEOUT_MS = 8000;
 
+export type SearchSource = 'youtube' | 'ytmusic';
+
 export function getSavedBackendUrl(): string {
   if (typeof window === 'undefined' || !window.localStorage) {
     return DEFAULT_BACKEND_URL;
@@ -455,13 +457,14 @@ export async function searchMedia(
   backendUrl: string,
   query: string,
   filter: SearchFilterType = 'all',
-  fetchImpl: typeof fetch = fetch
+  fetchImpl: typeof fetch = fetch,
+  source: SearchSource = 'youtube'
 ): Promise<MediaItem[]> {
   const base = normalizeBackendUrl(backendUrl) || DEFAULT_BACKEND_URL;
 
   try {
     const response = await fetchImpl(
-      `${base}/api/search?q=${encodeURIComponent(query)}&filter=${encodeURIComponent(filter)}`
+      `${base}/api/search?q=${encodeURIComponent(query)}&filter=${encodeURIComponent(filter)}&source=${encodeURIComponent(source)}`
     );
     if (!response.ok) {
       if (filter === 'radio') {
@@ -569,10 +572,12 @@ export async function searchMediaSmart(
   options?: {
     fetchImpl?: typeof fetch;
     localCandidates?: readonly string[];
+    source?: SearchSource;
   }
 ): Promise<{ items: MediaItem[]; correctedQuery: string | null }> {
   const fetchImpl = options?.fetchImpl ?? fetch;
-  const items = await searchMedia(backendUrl, query, filter, fetchImpl);
+  const source = options?.source ?? 'youtube';
+  const items = await searchMedia(backendUrl, query, filter, fetchImpl, source);
   if (items.length > 0) {
     return { items, correctedQuery: null };
   }
@@ -591,7 +596,7 @@ export async function searchMediaSmart(
     return { items: [], correctedQuery: null };
   }
 
-  const correctedItems = await searchMedia(backendUrl, candidate, filter, fetchImpl);
+  const correctedItems = await searchMedia(backendUrl, candidate, filter, fetchImpl, source);
   if (correctedItems.length > 0) {
     return { items: correctedItems, correctedQuery: candidate };
   }
