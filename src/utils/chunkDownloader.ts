@@ -2,8 +2,10 @@ import { Capacitor, CapacitorHttp } from '@capacitor/core';
 import type { MediaFormatMode } from '../types/media';
 import { DEFAULT_BACKEND_URL, resolveStream } from './api';
 import { normalizeBackendUrl } from './formatters';
+import { extractYouTubeVideoId } from './youtube';
 
-export const CHUNK_SIZE_BYTES = 2.5 * 1024 * 1024; // 2.5 MB (matches Vercel /api/stream)
+export const CHUNK_SIZE_BYTES = 2.5 * 1024 * 1024; // 2.5 MB proxy chunk (matches Vercel /api/stream)
+export const NATIVE_CHUNK_SIZE_BYTES = 8 * 1024 * 1024; // 8 MB direct chunk (fewer round trips)
 
 export interface ChunkDownloadProgress {
   receivedBytes: number;
@@ -71,6 +73,10 @@ function getHeaderInsensitive(
 
 function isLikelyLiveStreamUrl(url: string): boolean {
   return /\.(m3u8|m3u|pls)(\?|$)/i.test(url) || /\/stream\/?;?$/i.test(url) && !/audius/i.test(url);
+}
+
+function isYouTubeUrl(url: string): boolean {
+  return Boolean(extractYouTubeVideoId(url));
 }
 
 async function readResponseWithProgress(
@@ -197,8 +203,8 @@ async function downloadBinaryWithCapacitorHttp(
     throw new DOMException('Download aborted', 'AbortError');
   }
 
-  // 2. Chunked Range download when Content-Length is known (shows real progress + prevents memory spikes)
-  if (contentLength && contentLength > CHUNK_SIZE_BYTES) {
+  // 2. Chunked Range download when Content-Length is known (real progress, bounded memory)
+  if (contentLength && contentLength > NATIVE_CHUNK_SIZE_BYTES) {
     const chunks: Uint8Array[] = [];
     let offset = 0;
     let chunkIdx = 1;
@@ -208,13 +214,13 @@ async function downloadBinaryWithCapacitorHttp(
       if (signal.aborted) {
         throw new DOMException('Download aborted', 'AbortError');
       }
-      const endByte = Math.min(offset + CHUNK_SIZE_BYTES - 1, contentLength - 1);
+      const endByte = Math.min(offset + NATIVE_CHUNK_SIZE_BYTES - 1, contentLength - 1);
       const chunkResp = await CapacitorHttp.get({
         url,
         headers: { Range: `bytes=${offset}-${endByte}` },
         responseType: 'blob',
         connectTimeout: 12000,
-        readTimeout: 25000,
+        readTimeout: 30000,
       });
 
       if (
@@ -245,7 +251,7 @@ async function downloadBinaryWithCapacitorHttp(
       });
       chunkIdx += 1;
 
-      if (bytes.byteLength > CHUNK_SIZE_BYTES) {
+      if (bytes.byteLength > NATIVE_CHUNK_SIZE_BYTES) {
         break;
       }
     }
@@ -274,7 +280,7 @@ async function downloadBinaryWithCapacitorHttp(
     url,
     responseType: 'blob',
     connectTimeout: 12000,
-    readTimeout: 30000,
+    readTimeout: 45000,
   });
 
   if (signal.aborted) {
@@ -393,14 +399,16 @@ export async function downloadMediaInChunks(params: {
 
   const isNative = Capacitor.isNativePlatform();
 
-  // Step 1: Resolve Archive.org / PeerTube pages to their direct MP3/MP4 URL via Vercel
+  // Step 1: Resolve page URLs (Archive.org, PeerTube, YouTube) to a direct file URL
   const needsServerResolve =
-    /archive\.org\/details\//i.test(targetUrl) || /\/api\/v1\/videos\//i.test(targetUrl);
+    isYouTubeUrl(targetUrl) ||
+    /archive\.org\/details\//i.test(targetUrl) ||
+    /\/api\/v1\/videos\//i.test(targetUrl);
 
   let downloadUrl = targetUrl;
   if (needsServerResolve) {
     const resolved = await resolveStream(backendUrl, targetUrl, mode, quality, {
-      timeoutMs: 7000,
+      timeoutMs: 12000,
       fetchImpl,
       signal,
     });
@@ -413,7 +421,7 @@ export async function downloadMediaInChunks(params: {
     throw new Error('Live HLS streams cannot be downloaded offline.');
   }
 
-  // Step 2: Native iOS direct download via CapacitorHttp (zero CORS limits)
+  // Step 2: Native iOS direct download via CapacitorHttp (zero CORS limits, 8 MB ranges)
   if (isNative) {
     const nativeRes = await downloadBinaryWithCapacitorHttp(
       downloadUrl,
@@ -426,7 +434,7 @@ export async function downloadMediaInChunks(params: {
     }
   }
 
-  // Step 3: Direct browser fetch (works for Audius, Archive.org, Openverse, PeerTube CORS-enabled files)
+  // Step 3: Direct browser fetch (CORS-enabled files, and any URL on web)
   const directRes = await downloadFromDirectCandidate(
     downloadUrl,
     signal,
