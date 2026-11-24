@@ -11,12 +11,14 @@ import {
   Search,
   Sparkles,
   X,
+  Youtube,
 } from 'lucide-react';
 import type { MediaFormatMode, MediaItem, SearchFilterType } from '../types/media';
 import {
   fetchMediaInfo,
   fetchSearchSuggestions,
   searchMediaSmart,
+  type SearchSource,
 } from '../utils/api';
 import { formatDuration, isHttpUrl } from '../utils/formatters';
 import {
@@ -37,6 +39,15 @@ const SEARCH_FILTERS: Array<{ id: SearchFilterType; label: string }> = [
   { id: 'podcasts', label: 'Podcasts' },
   { id: 'radio', label: 'Radio' },
 ];
+
+const SOURCE_STORAGE_KEY = 'jtunes_search_source';
+
+function getSavedSource(): SearchSource {
+  if (typeof window === 'undefined' || !window.localStorage) {
+    return 'youtube';
+  }
+  return window.localStorage.getItem(SOURCE_STORAGE_KEY) === 'ytmusic' ? 'ytmusic' : 'youtube';
+}
 
 interface SearchViewProps {
   backendUrl: string;
@@ -70,6 +81,7 @@ export function SearchView({
     original: string;
     resolved: string;
   } | null>(null);
+  const [source, setSource] = useState<SearchSource>(() => getSavedSource());
 
   const [searchHistory, setSearchHistory] = useState<string[]>(() => getSavedSearchHistory());
   const [remoteSuggestions, setRemoteSuggestions] = useState<string[]>([]);
@@ -78,6 +90,14 @@ export function SearchView({
   const searchContainerRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const searchSeqRef = useRef<number>(0);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SOURCE_STORAGE_KEY, source);
+    } catch {
+      // Ignore private-mode storage failures
+    }
+  }, [source]);
 
   // Close suggestions dropdown on outside pointer down
   useEffect(() => {
@@ -141,7 +161,8 @@ export function SearchView({
 
   const runSearchOrResolve = async (
     rawInput: string,
-    filterToUse: SearchFilterType = activeFilter
+    filterToUse: SearchFilterType = activeFilter,
+    sourceToUse: SearchSource = source
   ) => {
     const trimmed = rawInput.trim();
     if (!trimmed) {
@@ -173,11 +194,13 @@ export function SearchView({
           updatedHistory,
           libraryTitles
         );
+        const effectiveFilter: SearchFilterType =
+          sourceToUse === 'ytmusic' ? 'audio' : filterToUse;
         const { items, correctedQuery } = await searchMediaSmart(
           backendUrl,
           trimmed,
-          filterToUse,
-          { localCandidates }
+          effectiveFilter,
+          { localCandidates, source: sourceToUse }
         );
         if (searchSeqRef.current !== requestSeq) {
           return;
@@ -205,14 +228,32 @@ export function SearchView({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    void runSearchOrResolve(searchQuery, activeFilter);
+    void runSearchOrResolve(searchQuery, activeFilter, source);
   };
 
   const handleSelectFilter = (filterId: SearchFilterType) => {
     onActiveFilterChange(filterId);
     const trimmed = searchQuery.trim();
     if (trimmed && !isHttpUrl(trimmed)) {
-      void runSearchOrResolve(trimmed, filterId);
+      void runSearchOrResolve(trimmed, filterId, source);
+    }
+  };
+
+  const handleSelectSource = (nextSource: SearchSource) => {
+    if (nextSource === source) {
+      return;
+    }
+    setSource(nextSource);
+    if (nextSource === 'ytmusic') {
+      onActiveFilterChange('audio');
+    }
+    const trimmed = searchQuery.trim();
+    if (trimmed && !isHttpUrl(trimmed)) {
+      void runSearchOrResolve(
+        trimmed,
+        nextSource === 'ytmusic' ? 'audio' : activeFilter,
+        nextSource
+      );
     }
   };
 
@@ -226,7 +267,7 @@ export function SearchView({
 
   const handleSelectSuggestion = (text: string) => {
     onSearchQueryChange(text);
-    void runSearchOrResolve(text, activeFilter);
+    void runSearchOrResolve(text, activeFilter, source);
   };
 
   const handleFillSuggestion = (text: string) => {
@@ -277,6 +318,42 @@ export function SearchView({
         Search
       </h1>
 
+      {/* Source switch */}
+      <div
+        role="tablist"
+        aria-label="Media source"
+        className="grid grid-cols-2 gap-1 rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-1"
+      >
+        <button
+          type="button"
+          role="tab"
+          aria-selected={source === 'youtube'}
+          onClick={() => handleSelectSource('youtube')}
+          className={`flex min-h-[38px] items-center justify-center gap-2 rounded-xl text-xs font-semibold transition-colors ${
+            source === 'youtube'
+              ? 'bg-accent-soft text-accent'
+              : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+          }`}
+        >
+          <Youtube size={15} />
+          YouTube
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={source === 'ytmusic'}
+          onClick={() => handleSelectSource('ytmusic')}
+          className={`flex min-h-[38px] items-center justify-center gap-2 rounded-xl text-xs font-semibold transition-colors ${
+            source === 'ytmusic'
+              ? 'bg-accent-soft text-accent'
+              : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+          }`}
+        >
+          <Music size={15} />
+          YouTube Music
+        </button>
+      </div>
+
       <div ref={searchContainerRef} className="relative">
         <form onSubmit={handleSubmit} className="flex flex-col gap-2.5 sm:flex-row sm:items-center">
           <div className="relative w-full sm:flex-1 min-w-0">
@@ -296,7 +373,11 @@ export function SearchView({
                 onSearchQueryChange(e.target.value);
                 setIsInputFocused(true);
               }}
-              placeholder="Search or paste URL..."
+              placeholder={
+                source === 'ytmusic'
+                  ? 'Search YouTube Music...'
+                  : 'Search or paste URL...'
+              }
               autoComplete="off"
               spellCheck={false}
               className="h-12 w-full rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] pl-10 pr-11 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-secondary)]/70 focus:border-[var(--accent)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-soft)]"
@@ -423,18 +504,20 @@ export function SearchView({
       >
         {SEARCH_FILTERS.map((filter) => {
           const isActive = activeFilter === filter.id;
+          const isDisabled = source === 'ytmusic' && filter.id !== 'audio';
           return (
             <button
               key={filter.id}
               type="button"
               role="tab"
               aria-selected={isActive}
+              disabled={isDisabled}
               onClick={() => handleSelectFilter(filter.id)}
               className={`min-h-[36px] shrink-0 rounded-xl border px-3.5 text-xs font-semibold transition-all duration-200 whitespace-nowrap ${
                 isActive
                   ? 'border-accent bg-accent-soft text-accent'
                   : 'border-[var(--border-subtle)] bg-[var(--bg-surface)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-              }`}
+              } ${isDisabled ? 'opacity-40' : ''}`}
             >
               {filter.label}
             </button>
