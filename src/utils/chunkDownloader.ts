@@ -3,9 +3,10 @@ import type { MediaFormatMode } from '../types/media';
 import { DEFAULT_BACKEND_URL, resolveStream } from './api';
 import { normalizeBackendUrl } from './formatters';
 import { extractYouTubeVideoId } from './youtube';
+import { resolveYouTubeDirect } from './youtubeDirect';
 
-export const CHUNK_SIZE_BYTES = 2.5 * 1024 * 1024; // 2.5 MB proxy chunk (matches Vercel /api/stream)
-export const NATIVE_CHUNK_SIZE_BYTES = 8 * 1024 * 1024; // 8 MB direct chunk (fewer round trips)
+export const CHUNK_SIZE_BYTES = 2.5 * 1024 * 1024;
+export const NATIVE_CHUNK_SIZE_BYTES = 8 * 1024 * 1024;
 
 export interface ChunkDownloadProgress {
   receivedBytes: number;
@@ -72,11 +73,7 @@ function getHeaderInsensitive(
 }
 
 function isLikelyLiveStreamUrl(url: string): boolean {
-  return /\.(m3u8|m3u|pls)(\?|$)/i.test(url) || /\/stream\/?;?$/i.test(url) && !/audius/i.test(url);
-}
-
-function isYouTubeUrl(url: string): boolean {
-  return Boolean(extractYouTubeVideoId(url));
+  return /\.(m3u8|m3u|pls)(\?|$)/i.test(url);
 }
 
 async function readResponseWithProgress(
@@ -169,7 +166,6 @@ async function downloadBinaryWithCapacitorHttp(
   signal: AbortSignal,
   onProgress: (progress: ChunkDownloadProgress) => void
 ): Promise<ChunkDownloadResult | null> {
-  // 1. Quick HEAD check to detect infinite live radio streams & get Content-Length
   let contentLength: number | null = null;
   let detectedMime = fallbackMime;
   try {
@@ -196,14 +192,12 @@ async function downloadBinaryWithCapacitorHttp(
     if (err instanceof Error && err.message === 'LIVE_RADIO_NOT_DOWNLOADABLE') {
       throw new Error('Live radio streams cannot be downloaded offline.');
     }
-    // Some servers reject HEAD; proceed to chunked/single GET below
   }
 
   if (signal.aborted) {
     throw new DOMException('Download aborted', 'AbortError');
   }
 
-  // 2. Chunked Range download when Content-Length is known (real progress, bounded memory)
   if (contentLength && contentLength > NATIVE_CHUNK_SIZE_BYTES) {
     const chunks: Uint8Array[] = [];
     let offset = 0;
@@ -268,7 +262,6 @@ async function downloadBinaryWithCapacitorHttp(
     }
   }
 
-  // 3. Single-shot download with strict readTimeout so infinite streams can never hang forever
   onProgress({
     receivedBytes: 0,
     totalBytes: contentLength,
@@ -399,21 +392,30 @@ export async function downloadMediaInChunks(params: {
 
   const isNative = Capacitor.isNativePlatform();
 
-  // Step 1: Resolve page URLs (Archive.org, PeerTube, YouTube) to a direct file URL
-  const needsServerResolve =
-    isYouTubeUrl(targetUrl) ||
-    /archive\.org\/details\//i.test(targetUrl) ||
-    /\/api\/v1\/videos\//i.test(targetUrl);
-
+  // Step 1: YouTube resolves ON THE PHONE (real IP, no server round-trip)
   let downloadUrl = targetUrl;
-  if (needsServerResolve) {
-    const resolved = await resolveStream(backendUrl, targetUrl, mode, quality, {
-      timeoutMs: 12000,
-      fetchImpl,
-      signal,
-    });
-    if (resolved.resolved && resolved.directUrl) {
-      downloadUrl = resolved.directUrl;
+  const ytId = extractYouTubeVideoId(targetUrl);
+
+  if (ytId && isNative) {
+    const direct = await resolveYouTubeDirect(ytId, mode, quality);
+    if (direct) {
+      downloadUrl = direct.url;
+    }
+  }
+
+  // Step 1b: other page URLs still need the server
+  if (downloadUrl === targetUrl) {
+    const needsServerResolve =
+      /archive\.org\/details\//i.test(targetUrl) || /\/api\/v1\/videos\//i.test(targetUrl);
+    if (needsServerResolve) {
+      const resolved = await resolveStream(backendUrl, targetUrl, mode, quality, {
+        timeoutMs: 12000,
+        fetchImpl,
+        signal,
+      });
+      if (resolved.resolved && resolved.directUrl) {
+        downloadUrl = resolved.directUrl;
+      }
     }
   }
 
@@ -421,7 +423,7 @@ export async function downloadMediaInChunks(params: {
     throw new Error('Live HLS streams cannot be downloaded offline.');
   }
 
-  // Step 2: Native iOS direct download via CapacitorHttp (zero CORS limits, 8 MB ranges)
+  // Step 2: native direct download, 8 MB ranges
   if (isNative) {
     const nativeRes = await downloadBinaryWithCapacitorHttp(
       downloadUrl,
@@ -434,7 +436,7 @@ export async function downloadMediaInChunks(params: {
     }
   }
 
-  // Step 3: Direct browser fetch (CORS-enabled files, and any URL on web)
+  // Step 3: direct browser fetch
   const directRes = await downloadFromDirectCandidate(
     downloadUrl,
     signal,
@@ -446,7 +448,7 @@ export async function downloadMediaInChunks(params: {
     return directRes;
   }
 
-  // Step 4: Vercel 2.5 MB chunked proxy fallback (bypasses browser CORS on Podcast MP3 CDNs)
+  // Step 4: chunked proxy fallback
   const collectedChunks: Uint8Array[] = [];
   let offset = 0;
   let chunkIndex = 1;
