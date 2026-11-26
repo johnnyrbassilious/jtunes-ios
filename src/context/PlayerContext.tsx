@@ -74,93 +74,12 @@ interface NetworkInformationLike {
 }
 
 interface NativeInnertubeProfile {
-  name: 'VISIONOS' | 'ANDROID_VR' | 'IOS' | 'TVHTML5' | 'WEB';
+  name: string;
   userAgent: string;
   clientNameHeader: string;
   clientVersion: string;
   clientPayload: Record<string, unknown>;
 }
-
-const NATIVE_IOS_INNERTUBE_PROFILES: readonly NativeInnertubeProfile[] = [
-  {
-    name: 'VISIONOS',
-    userAgent:
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15',
-    clientNameHeader: '101',
-    clientVersion: '1.02',
-    clientPayload: {
-      clientName: 'VISIONOS',
-      clientVersion: '1.02',
-      deviceMake: 'Apple',
-      deviceModel: 'RealityDevice17,1',
-      osName: 'visionOS',
-      osVersion: '26.5.23O471',
-      hl: 'en',
-      gl: 'US',
-    },
-  },
-  {
-    name: 'ANDROID_VR',
-    userAgent:
-      'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-    clientNameHeader: '28',
-    clientVersion: '1.65.10',
-    clientPayload: {
-      clientName: 'ANDROID_VR',
-      clientVersion: '1.65.10',
-      deviceMake: 'Oculus',
-      deviceModel: 'Quest 3',
-      androidSdkVersion: 32,
-      osName: 'Android',
-      osVersion: '12L',
-      hl: 'en',
-      gl: 'US',
-    },
-  },
-  {
-    name: 'IOS',
-    userAgent:
-      'com.google.ios.youtube/20.11.6 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
-    clientNameHeader: '5',
-    clientVersion: '20.11.6',
-    clientPayload: {
-      clientName: 'IOS',
-      clientVersion: '20.11.6',
-      deviceMake: 'Apple',
-      deviceModel: 'iPhone16,2',
-      osName: 'iPhone',
-      osVersion: '18.3.2.22D82',
-      hl: 'en',
-      gl: 'US',
-    },
-  },
-  {
-    name: 'TVHTML5',
-    userAgent:
-      'Mozilla/5.0 (PlayStation; PlayStation 5/2.26) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0 Safari/605.1.15',
-    clientNameHeader: '85',
-    clientVersion: '2.0',
-    clientPayload: {
-      clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
-      clientVersion: '2.0',
-      hl: 'en',
-      gl: 'US',
-    },
-  },
-  {
-    name: 'WEB',
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-    clientNameHeader: '1',
-    clientVersion: '2.20241010.01.00',
-    clientPayload: {
-      clientName: 'WEB',
-      clientVersion: '2.20241010.01.00',
-      hl: 'en',
-      gl: 'US',
-    },
-  },
-];
 
 const NATIVE_AUDIO_ASSET_ID = 'jtunes-active-track';
 const DUAL_AUDIO_ASSET_ID = 'jtunes-active-track-audio';
@@ -323,140 +242,6 @@ function getEffectiveRequestMode(
   return isAudioOnly || slowNetwork || track.mode === 'audio' ? 'audio' : 'video';
 }
 
-type RawFormat = Record<string, unknown>;
-
-function formatMime(f: RawFormat): string {
-  return typeof f.mimeType === 'string' ? f.mimeType : '';
-}
-
-function formatUrl(f: RawFormat): string {
-  return typeof f.url === 'string' ? f.url : '';
-}
-
-function formatHeight(f: RawFormat): number {
-  return Number(f.height ?? 0) || 0;
-}
-
-function formatBitrate(f: RawFormat): number {
-  return Number(f.bitrate ?? f.averageBitrate ?? 0) || 0;
-}
-
-function cleanMime(f: RawFormat, fallback: string): string {
-  return formatMime(f).split(';')[0].trim() || fallback;
-}
-
-/** Best audio-only track, preferring AAC/m4a because AVPlayer handles it natively. */
-function pickAudioFormat(
-  adaptiveFormats: RawFormat[],
-  formats: RawFormat[],
-  preferLowestOverhead: boolean
-): { url: string; mime: string } | null {
-  const allAudio = [...adaptiveFormats, ...formats].filter((f) => {
-    return formatUrl(f).length > 0 && formatMime(f).startsWith('audio/');
-  });
-  if (allAudio.length === 0) {
-    return null;
-  }
-  const mp4Audio = allAudio.filter((f) =>
-    formatMime(f).toLowerCase().includes('audio/mp4')
-  );
-  const pool = mp4Audio.length > 0 ? mp4Audio : allAudio;
-  const sorted = [...pool].sort((a, b) =>
-    preferLowestOverhead ? formatBitrate(a) - formatBitrate(b) : formatBitrate(b) - formatBitrate(a)
-  );
-  const chosen = preferLowestOverhead
-    ? sorted.find((f) => formatBitrate(f) >= 48_000) ?? sorted[0]
-    : sorted[0];
-  return {
-    url: formatUrl(chosen),
-    mime: cleanMime(chosen, 'audio/mp4'),
-  };
-}
-
-function pickNativeIosStreamingFormat(
-  streamingData: Record<string, unknown>,
-  mode: MediaFormatMode,
-  quality: string,
-  preferLowestOverhead: boolean
-): Omit<ResolvedStreamCacheEntry, 'expiresAt'> | null {
-  const formats = Array.isArray(streamingData.formats)
-    ? (streamingData.formats as RawFormat[])
-    : [];
-  const adaptiveFormats = Array.isArray(streamingData.adaptiveFormats)
-    ? (streamingData.adaptiveFormats as RawFormat[])
-    : [];
-  const hlsManifestUrl =
-    typeof streamingData.hlsManifestUrl === 'string' && streamingData.hlsManifestUrl.length > 0
-      ? streamingData.hlsManifestUrl
-      : null;
-
-  if (mode === 'audio') {
-    const picked = pickAudioFormat(adaptiveFormats, formats, preferLowestOverhead);
-    if (picked) {
-      return picked;
-    }
-    if (hlsManifestUrl) {
-      return { url: hlsManifestUrl, mime: 'application/x-mpegURL', isHls: true };
-    }
-    return null;
-  }
-
-  const desiredHeight = Number.parseInt(quality, 10) || 720;
-
-  // 1. Progressive MP4 already contains picture and sound in one request.
-  const progressiveMp4 = formats.filter(
-    (f) => formatUrl(f).length > 0 && formatMime(f).includes('video/mp4')
-  );
-  if (progressiveMp4.length > 0) {
-    const sorted = [...progressiveMp4].sort(
-      (a, b) => formatHeight(b) - formatHeight(a)
-    );
-    const chosen =
-      sorted.find((f) => formatHeight(f) === desiredHeight) ??
-      sorted.find((f) => {
-        const h = formatHeight(f);
-        return h > 0 && h <= desiredHeight;
-      }) ??
-      sorted[sorted.length - 1];
-    return {
-      url: formatUrl(chosen),
-      mime: cleanMime(chosen, 'video/mp4'),
-    };
-  }
-
-  // 2. HLS: AVPlayer and WKWebView both mux this natively.
-  if (hlsManifestUrl) {
-    return { url: hlsManifestUrl, mime: 'application/x-mpegURL', isHls: true };
-  }
-
-  // 3. Adaptive video + separate audio, muxed client-side.
-  const adaptiveVideo = adaptiveFormats.filter(
-    (f) => formatUrl(f).length > 0 && formatMime(f).startsWith('video/mp4')
-  );
-  if (adaptiveVideo.length > 0) {
-    const capped = adaptiveVideo.filter((f) => {
-      const h = formatHeight(f);
-      return h > 0 && h <= desiredHeight;
-    });
-    const pool = [...(capped.length > 0 ? capped : adaptiveVideo)].sort(
-      (a, b) => formatHeight(b) - formatHeight(a) || formatBitrate(b) - formatBitrate(a)
-    );
-    const chosenVideo = pool[0];
-    const audio = pickAudioFormat(adaptiveFormats, formats, false);
-    const entry: Omit<ResolvedStreamCacheEntry, 'expiresAt'> = {
-      url: formatUrl(chosenVideo),
-      mime: cleanMime(chosenVideo, 'video/mp4'),
-    };
-    if (audio) {
-      entry.audioUrl = audio.url;
-      entry.audioMime = audio.mime;
-    }
-    return entry;
-  }
-
-  return null;
-}
-
 async function resolveNativeIosInnertubeStream(
   videoId: string,
   mode: MediaFormatMode,
@@ -468,7 +253,7 @@ async function resolveNativeIosInnertubeStream(
     return null;
   }
   void preferLowestOverhead;
-  const resolved = await resolveYouTubeDirect(videoId, mode, quality as VideoQuality, signal);
+  const resolved = await resolveYouTubeDirect(videoId, mode, quality as VideoQuality);
   if (!resolved || signal?.aborted) {
     return null;
   }
@@ -586,15 +371,12 @@ export function PlayerProvider({
   const nativeAudioPollRef = useRef<number | null>(null);
   const handleEndedRef = useRef<() => Promise<void>>(async () => {});
 
-  // Split-stream (video + separate audio) state
   const dualAudioActiveRef = useRef(false);
   const dualVideoElRef = useRef<HTMLVideoElement | null>(null);
-  // Position to re-apply after a background hand-off rebuilds the player
   const pendingSeekRef = useRef<number | null>(null);
   const handoffRef = useRef<{ trackId: string; position: number } | null>(null);
   const currentTrackRef = useRef<PlayableTrack | null>(null);
   const currentTimeRef = useRef(0);
-  currentTimeRef.current = 0;
 
   const [queue, setQueue] = useState<PlayableTrack[]>([]);
   const [currentIndex, setCurrentIndex] = useState(-1);
@@ -632,6 +414,7 @@ export function PlayerProvider({
   }, [queue, currentIndex]);
 
   currentTrackRef.current = currentTrack;
+  currentTimeRef.current = currentTime;
 
   const useAudioElementForTrack = useCallback((track: PlayableTrack | null): boolean => {
     if (!track) {
@@ -732,7 +515,6 @@ export function PlayerProvider({
           const audioPosition = res.currentTime;
           setCurrentTime(audioPosition);
 
-          // Keep the muted video frame glued to the audio track.
           const video = dualVideoElRef.current;
           if (dualAudioActiveRef.current && video && Number.isFinite(video.currentTime)) {
             const drift = video.currentTime - audioPosition;
@@ -756,7 +538,6 @@ export function PlayerProvider({
     }, 500);
   }, [clearNativeAudioPoll]);
 
-  // Configure native iOS AVPlayer background audio & Lock Screen notification controls once on mount
   useEffect(() => {
     if (!Capacitor.isNativePlatform()) {
       return;
@@ -963,7 +744,6 @@ export function PlayerProvider({
 
       const slowNetwork = isSlowNetworkConnection();
 
-      // 1. Native iOS CapacitorHttp direct InnerTube resolution
       if (ytId && Capacitor.isNativePlatform()) {
         const nativeEntry = await resolveNativeIosInnertubeStream(
           ytId,
@@ -982,7 +762,6 @@ export function PlayerProvider({
         return { entry: null, cacheKey };
       }
 
-      // 2. Backend /api/resolve-stream fallback
       const result = await resolveStream(backendUrl, targetUrl, requestMode, quality, {
         timeoutMs,
         signal,
@@ -1079,8 +858,6 @@ export function PlayerProvider({
     [stopBackgroundKeepAlive, stopInactiveMediaEl, stopNativeAudio]
   );
 
-  // Split stream: muted <video> for the picture, native AVPlayer for the sound.
-  // This is what lets 1080p and audio-less progressive formats play at all.
   const startDualStreamPlayback = useCallback(
     (
       videoEl: HTMLVideoElement,
@@ -1149,7 +926,6 @@ export function PlayerProvider({
             })
             .catch(() => {});
         } catch {
-          // Audio leg failed: unmute the video so the clip is at least audible.
           dualAudioActiveRef.current = false;
           isNativeAudioActiveRef.current = false;
           videoEl.muted = false;
@@ -1157,11 +933,16 @@ export function PlayerProvider({
         }
       })();
     },
-    [applyPendingSeek, startHtmlMediaPlayback, startNativeAudioPoll, stopBackgroundKeepAlive, stopInactiveMediaEl, stopNativeAudio]
+    [
+      applyPendingSeek,
+      startHtmlMediaPlayback,
+      startNativeAudioPoll,
+      stopBackgroundKeepAlive,
+      stopInactiveMediaEl,
+      stopNativeAudio,
+    ]
   );
 
-  // Route remote Audio Mode / Live Radio streams through native iOS AVPlayer (@capgo/capacitor-native-audio)
-  // so playback continues uninterrupted on Lock Screen and outside WKWebView.
   const startNativeMediaPlayback = useCallback(
     (
       mediaEl: HTMLMediaElement,
@@ -1247,7 +1028,6 @@ export function PlayerProvider({
           if (typeof activeToken === 'number' && loadNonceRef.current !== activeToken) {
             return;
           }
-          // Graceful fallback to HTML <audio> if native AVPlayer rejects a specific stream URL
           isNativeAudioActiveRef.current = false;
           startHtmlMediaPlayback(mediaEl, effectiveSrc, rate);
         }
@@ -1266,7 +1046,6 @@ export function PlayerProvider({
     ]
   );
 
-  // Instant playback loader + Native AVPlayer / HTML <audio> / <video> routing
   useEffect(() => {
     const mediaEl = getActiveMediaEl(currentTrack);
     if (!mediaEl) {
@@ -1333,7 +1112,6 @@ export function PlayerProvider({
     setDuration(currentTrack.duration > 0 ? currentTrack.duration : 0);
     setIsBuffering(true);
 
-    // 1. Offline Blob playback
     const offlineBlob = currentTrack.offlineBlob ?? currentTrack.blob;
     if (!overrideStreamUrl && (currentTrack.isOffline || offlineBlob) && offlineBlob) {
       revokeActiveObjectUrl();
@@ -1347,7 +1125,6 @@ export function PlayerProvider({
       revokeActiveObjectUrl();
     }
 
-    // 2. Live radio or explicit directStreamUrl
     if (!overrideStreamUrl && (currentTrack.directStreamUrl || currentTrack.isLiveRadio)) {
       const radioUrl =
         currentTrack.directStreamUrl ||
@@ -1361,14 +1138,12 @@ export function PlayerProvider({
       }
     }
 
-    // 3. Explicit override or already-resolved stream URL
     const preResolvedSrc = overrideStreamUrl || currentTrack.streamUrl;
     if (preResolvedSrc) {
       startNativeMediaPlayback(mediaEl, preResolvedSrc, playbackRate, currentTrack, activeToken);
       return;
     }
 
-    // 4. Unresolved stream URL: check cache first, then native iOS / backend
     const targetUrl = currentTrack.sourceUrl || currentTrack.url || '';
     const ytId = extractYouTubeVideoId(targetUrl, currentTrack.id);
     if (!targetUrl && !ytId) {
@@ -1464,7 +1239,6 @@ export function PlayerProvider({
     onListenHistoryUpdated,
   ]);
 
-  // Silent background pre-resolution for the NEXT track
   useEffect(() => {
     if (currentIndex < 0 || queue.length === 0) {
       return;
@@ -2454,7 +2228,6 @@ export function PlayerProvider({
   const playPreviousRef = useRef(playPrevious);
   playPreviousRef.current = playPrevious;
 
-  // MediaSession integration for Lock Screen & Dynamic Island
   useEffect(() => {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) {
       return;
@@ -2573,7 +2346,6 @@ export function PlayerProvider({
     }
   }, [currentTrack, duration, currentTime, playbackRate]);
 
-  // Hand a playing video's audio to AVPlayer so it survives the app going to the background.
   const handoffToAudioOnlyForBackground = useCallback(async () => {
     const track = currentTrackRef.current;
     if (!track || track.isLiveRadio || track.isOffline || audioOnlyModeRef.current) {
@@ -2643,7 +2415,6 @@ export function PlayerProvider({
     stopNativeAudio,
   ]);
 
-  // Keep background playback alive when screen locks or app enters background
   useEffect(() => {
     if (typeof document === 'undefined') {
       return;
@@ -2652,7 +2423,6 @@ export function PlayerProvider({
       if (document.visibilityState === 'hidden') {
         backgroundHiddenAtRef.current = Date.now();
 
-        // Video mode: move the sound to AVPlayer before WKWebView suspends.
         if (!audioOnlyModeRef.current && shouldKeepPlayingInBackgroundRef.current) {
           void handoffToAudioOnlyForBackground();
         }
@@ -2674,7 +2444,6 @@ export function PlayerProvider({
           }
         }
       } else {
-        // Back in the foreground: rebuild the video at the same position.
         const handoff = handoffRef.current;
         if (handoff && currentTrackRef.current?.id === handoff.trackId) {
           handoffRef.current = null;
@@ -2846,7 +2615,6 @@ export function PlayerProvider({
   const tryStartTrackSynchronouslyOnMedia = useCallback(
     (nextTrack: PlayableTrack): boolean => {
       if (Capacitor.isNativePlatform() && useAudioElementForTrack(nextTrack)) {
-        // Native AVPlayer loads cleanly via useEffect without needing the WKWebView synchronous <video> workaround
         return false;
       }
 
@@ -3110,7 +2878,6 @@ export function PlayerProvider({
       return;
     }
 
-    // Stage 1: drop the cached URL and rebuild once before surrendering to the iframe.
     if (triedFallbackStageRef.current < 1) {
       triedFallbackStageRef.current = 1;
       setPlayerError(null);
@@ -3129,7 +2896,6 @@ export function PlayerProvider({
       return;
     }
 
-    // Stage 2: last resort, the YouTube embed.
     const targetUrl = currentTrack.sourceUrl || currentTrack.url || '';
     const ytId = extractYouTubeVideoId(targetUrl, currentTrack.id);
     if (triedFallbackStageRef.current < 2 && ytId) {
@@ -3425,7 +3191,6 @@ export function PlayerProvider({
         </div>
       </div>
 
-      {/* Dedicated HTML <audio> fallback for web browser and offline IndexedDB blobs */}
       <audio
         ref={audioRef}
         playsInline
@@ -3463,7 +3228,6 @@ export function PlayerProvider({
         onError={handleMediaError}
       />
 
-      {/* Hidden silent keep-alive audio element for async track transitions */}
       <audio
         ref={keepAliveAudioRef}
         loop
