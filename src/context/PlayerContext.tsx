@@ -55,6 +55,7 @@ import {
   recordListenHistoryEntry,
 } from '../utils/profileAndHistory';
 import { extractYouTubeVideoId } from '../utils/youtube';
+import { resolveYouTubeDirect } from '../utils/youtubeDirect';
 
 interface ResolvedStreamCacheEntry {
   url: string;
@@ -463,66 +464,22 @@ async function resolveNativeIosInnertubeStream(
   preferLowestOverhead: boolean,
   signal?: AbortSignal
 ): Promise<ResolvedStreamCacheEntry | null> {
-  if (!Capacitor.isNativePlatform()) {
+  if (!Capacitor.isNativePlatform() || signal?.aborted) {
     return null;
   }
-
-  for (const profile of NATIVE_IOS_INNERTUBE_PROFILES) {
-    if (signal?.aborted) {
-      return null;
-    }
-    try {
-      const resp = await CapacitorHttp.post({
-        url: 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent': profile.userAgent,
-          'X-YouTube-Client-Name': profile.clientNameHeader,
-          'X-YouTube-Client-Version': profile.clientVersion,
-          Origin: 'https://www.youtube.com',
-        },
-        data: {
-          videoId,
-          context: {
-            client: profile.clientPayload,
-          },
-          contentCheckOk: true,
-          racyCheckOk: true,
-        },
-      });
-      if (resp.status < 200 || resp.status >= 300 || !resp.data) {
-        continue;
-      }
-      const parsed =
-        typeof resp.data === 'string'
-          ? (JSON.parse(resp.data) as Record<string, unknown>)
-          : (resp.data as Record<string, unknown>);
-      const playability = parsed.playabilityStatus as Record<string, unknown> | undefined;
-      if (playability?.status && playability.status !== 'OK') {
-        continue;
-      }
-      const streamingData = parsed.streamingData as Record<string, unknown> | undefined;
-      if (!streamingData || typeof streamingData !== 'object') {
-        continue;
-      }
-      const picked = pickNativeIosStreamingFormat(
-        streamingData,
-        mode,
-        quality,
-        preferLowestOverhead
-      );
-      if (picked) {
-        return {
-          ...picked,
-          expiresAt: computeStreamExpiry(picked.url),
-        };
-      }
-    } catch {
-      // Try next InnerTube client profile
-    }
+  void preferLowestOverhead;
+  const resolved = await resolveYouTubeDirect(videoId, mode, quality as VideoQuality, signal);
+  if (!resolved || signal?.aborted) {
+    return null;
   }
-
-  return null;
+  return {
+    url: resolved.url,
+    mime: resolved.mime,
+    audioUrl: resolved.audioUrl,
+    audioMime: resolved.audioMime,
+    isHls: resolved.isHls,
+    expiresAt: computeStreamExpiry(resolved.url),
+  };
 }
 
 interface PlayerProviderProps {
