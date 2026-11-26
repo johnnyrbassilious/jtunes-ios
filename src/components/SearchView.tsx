@@ -28,6 +28,7 @@ import {
   getSavedSearchHistory,
   removeSearchHistoryEntry,
 } from '../utils/profileAndHistory';
+import { isDirectYouTubeSupported, searchYouTubeDirect } from '../utils/youtubeDirect';
 import { usePlayer } from '../context/PlayerContext';
 import type { ActionSheetTarget } from './MediaActionSheet';
 import { ThumbnailArt } from './ThumbnailArt';
@@ -41,12 +42,22 @@ const SEARCH_FILTERS: Array<{ id: SearchFilterType; label: string }> = [
 ];
 
 const SOURCE_STORAGE_KEY = 'jtunes_search_source';
+const BACKEND_SEARCH_TIMEOUT_MS = 10000;
 
 function getSavedSource(): SearchSource {
   if (typeof window === 'undefined' || !window.localStorage) {
     return 'youtube';
   }
   return window.localStorage.getItem(SOURCE_STORAGE_KEY) === 'ytmusic' ? 'ytmusic' : 'youtube';
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error('Search timed out. Try again.')), ms)
+    ),
+  ]);
 }
 
 interface SearchViewProps {
@@ -99,7 +110,6 @@ export function SearchView({
     }
   }, [source]);
 
-  // Close suggestions dropdown on outside pointer down
   useEffect(() => {
     const handleOutsideClick = (e: MouseEvent) => {
       if (
@@ -113,7 +123,6 @@ export function SearchView({
     return () => document.removeEventListener('mousedown', handleOutsideClick);
   }, []);
 
-  // Debounced 220ms live autocomplete suggestions from /api/suggestions
   useEffect(() => {
     const trimmed = searchQuery.trim();
     if (!trimmed || isHttpUrl(trimmed)) {
@@ -180,45 +189,55 @@ export function SearchView({
 
     try {
       if (isHttpUrl(trimmed)) {
-        const resolved = await fetchMediaInfo(backendUrl, trimmed);
+        const resolved = await withTimeout(fetchMediaInfo(backendUrl, trimmed), BACKEND_SEARCH_TIMEOUT_MS);
         if (searchSeqRef.current !== requestSeq) {
           return;
         }
         onSearchResultsChange([resolved]);
-      } else {
-        const updatedHistory = addSearchHistoryEntry(trimmed);
-        setSearchHistory(updatedHistory);
+        return;
+      }
 
-        const localCandidates = getFuzzyLocalSuggestions(
-          trimmed,
-          updatedHistory,
-          libraryTitles
-        );
-        const effectiveFilter: SearchFilterType =
-          sourceToUse === 'ytmusic' ? 'audio' : filterToUse;
-        const { items, correctedQuery } = await searchMediaSmart(
-          backendUrl,
-          trimmed,
-          effectiveFilter,
-          { localCandidates, source: sourceToUse }
-        );
+      const updatedHistory = addSearchHistoryEntry(trimmed);
+      setSearchHistory(updatedHistory);
+
+      const musicOnly = sourceToUse === 'ytmusic' || filterToUse === 'audio';
+
+      // Primary path: search YouTube straight from the device.
+      if (isDirectYouTubeSupported() && (sourceToUse === 'youtube' || sourceToUse === 'ytmusic')) {
+        const directItems = await searchYouTubeDirect(trimmed, musicOnly, 24);
         if (searchSeqRef.current !== requestSeq) {
           return;
         }
-        onSearchResultsChange(items);
-        if (correctedQuery) {
-          setCorrectedFrom({ original: trimmed, resolved: correctedQuery });
-        } else if (items.length === 0) {
-          setErrorMessage('No results found.');
+        if (directItems.length > 0) {
+          onSearchResultsChange(directItems);
+          return;
         }
+        if (sourceToUse === 'ytmusic') {
+          setErrorMessage('No results found.');
+          return;
+        }
+      }
+
+      // Fallback: backend (open sources, podcasts, radio)
+      const localCandidates = getFuzzyLocalSuggestions(trimmed, updatedHistory, libraryTitles);
+      const { items, correctedQuery } = await withTimeout(
+        searchMediaSmart(backendUrl, trimmed, filterToUse, { localCandidates, source: sourceToUse }),
+        BACKEND_SEARCH_TIMEOUT_MS
+      );
+      if (searchSeqRef.current !== requestSeq) {
+        return;
+      }
+      onSearchResultsChange(items);
+      if (correctedQuery) {
+        setCorrectedFrom({ original: trimmed, resolved: correctedQuery });
+      } else if (items.length === 0) {
+        setErrorMessage('No results found.');
       }
     } catch (err) {
       if (searchSeqRef.current !== requestSeq) {
         return;
       }
-      setErrorMessage(
-        err instanceof Error ? err.message : 'Unable to reach server.'
-      );
+      setErrorMessage(err instanceof Error ? err.message : 'Unable to reach server.');
     } finally {
       if (searchSeqRef.current === requestSeq) {
         setIsLoading(false);
@@ -318,7 +337,6 @@ export function SearchView({
         Search
       </h1>
 
-      {/* Source switch */}
       <div
         role="tablist"
         aria-label="Media source"
@@ -410,7 +428,6 @@ export function SearchView({
           </button>
         </form>
 
-        {/* YouTube Music Style Dropdown: Search History OR Live Suggestions */}
         {(showHistoryDropdown || showSuggestionDropdown) && (
           <div
             role="listbox"
@@ -496,7 +513,6 @@ export function SearchView({
         )}
       </div>
 
-      {/* Horizontal Filter Tabs */}
       <div
         role="tablist"
         aria-label="Search filters"
